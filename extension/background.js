@@ -1,18 +1,26 @@
 // GeoPrice Travel — Background Service Worker
 // Routes booking.com through the server relay proxy (hotels.chatleg.ai:8766)
 // using a PAC script + token-based proxy auth via onAuthRequired.
+//
+// Token is stored in chrome.storage.session so it survives service worker restarts
+// (module-level variables reset when the SW is killed between events).
 
 let activeProxyTabId = null;
-let currentToken = null;   // token for the active proxy session
 
 // ── Proxy auth: supply token when the relay proxy sends a 407 challenge ──
 chrome.webRequest.onAuthRequired.addListener(
   (details, callback) => {
-    if (details.isProxy && currentToken) {
-      callback({ authCredentials: { username: currentToken, password: 'x' } });
-    } else {
+    if (!details.isProxy) {
       callback({});
+      return;
     }
+    chrome.storage.session.get('proxyToken').then(({ proxyToken }) => {
+      if (proxyToken) {
+        callback({ authCredentials: { username: proxyToken, password: 'x' } });
+      } else {
+        callback({});
+      }
+    }).catch(() => callback({}));
   },
   { urls: ['<all_urls>'] },
   ['asyncBlocking']
@@ -41,13 +49,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 async function handleGeoOpen({ token, booking_url, geo }) {
-  // 1. Store token so onAuthRequired can supply it
-  currentToken = token;
+  // 1. Persist token so onAuthRequired can supply it even after SW restart
+  await chrome.storage.session.set({ proxyToken: token });
 
-  // 2. Fetch PAC script from server (now points to relay: hotels.chatleg.ai:8766)
+  // 2. Fetch PAC script from server (points to relay: hotels.chatleg.ai:8766)
   const res = await fetch(`https://hotels.chatleg.ai/api/pac/${token}`);
   if (!res.ok) {
-    currentToken = null;
+    await chrome.storage.session.remove('proxyToken');
     throw new Error(`PAC fetch failed: ${res.status}`);
   }
   const { pac } = await res.json();
@@ -82,8 +90,8 @@ async function handleGeoOpen({ token, booking_url, geo }) {
   });
 }
 
-function clearProxy() {
-  currentToken = null;
+async function clearProxy() {
+  await chrome.storage.session.remove('proxyToken').catch(() => {});
   chrome.proxy.settings.clear({ scope: 'regular' }, () => {
     if (chrome.runtime.lastError) {
       console.warn('[GeoPrice] Error clearing proxy:', chrome.runtime.lastError.message);

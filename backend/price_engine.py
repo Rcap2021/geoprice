@@ -371,8 +371,9 @@ class PriceEngine:
             except Exception:
                 pass  # If homepage times out, still try the search
 
-            # Navigate to search
-            url = self._build_booking_url(intent, geo_info["currency"])
+            # Navigate to search — force USD so all geos use the same DOM/currency,
+            # avoiding exchange-rate errors and locale-specific price selector failures.
+            url = self._build_booking_url(intent, "USD")
             print(f"[{geo_code}] Scraping: {url}")
 
             await page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
@@ -493,14 +494,14 @@ class PriceEngine:
             if intent.check_in and intent.check_out:
                 nights = max(1, (intent.check_out - intent.check_in).days)
 
-            # Parse and normalize results
+            # Parse and normalize results — all prices are in USD (forced above)
             for hotel in hotels:
-                price_value = self._parse_price(hotel["price"], geo_info["currency"]) * nights
-                # Add taxes/fees if shown separately (common on US locale)
-                tax_value = self._parse_price(hotel.get("taxText", ""), geo_info["currency"])
+                price_value = self._parse_price(hotel["price"], "USD") * nights
+                # Add taxes/fees if shown separately
+                tax_value = self._parse_price(hotel.get("taxText", ""), "USD")
                 if tax_value > 0:
                     price_value += tax_value * nights
-                    print(f"[{geo_code}] Tax added for {hotel['name']}: +{tax_value} {geo_info['currency']}")
+                    print(f"[{geo_code}] Tax added for {hotel['name']}: +${tax_value:.2f}")
                 if price_value > 0:
                     results.append({
                         "hotel_name": hotel["name"],
@@ -509,8 +510,8 @@ class PriceEngine:
                         "location": hotel["location"],
                         "geo_country": geo_code,
                         "geo_price": price_value,
-                        "geo_currency": geo_info["currency"],
-                        "usd_price": self._to_usd(price_value, geo_info["currency"]),
+                        "geo_currency": "USD",
+                        "usd_price": price_value,  # already USD, no conversion needed
                         "room_type": None,
                         "includes_breakfast": hotel["breakfast"],
                         "free_cancellation": hotel["freeCancel"],
