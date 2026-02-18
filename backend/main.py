@@ -5,7 +5,7 @@ Chat interface + Price search engine
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import date, datetime, timedelta
@@ -394,6 +394,15 @@ async def root():
     if html_path.exists():
         return HTMLResponse(content=html_path.read_text())
     return HTMLResponse(content="<h1>GeoPrice API running. Frontend not found.</h1>")
+
+
+@app.get("/extension/geoprice-extension.zip")
+async def download_extension():
+    """Serve the Chrome extension as a downloadable zip."""
+    zip_path = Path(__file__).parent.parent / "extension" / "geoprice-extension.zip"
+    if not zip_path.exists():
+        raise HTTPException(status_code=404, detail="Extension zip not found")
+    return FileResponse(zip_path, media_type="application/zip", filename="geoprice-extension.zip")
 
 
 @app.get("/api/health")

@@ -12,9 +12,14 @@ window.addEventListener('message', (event) => {
   if (event.source !== window) return;
   if (!event.data || event.data.type !== 'GEOPRICE_OPEN') return;
 
-  chrome.runtime.sendMessage(event.data, (response) => {
-    if (chrome.runtime.lastError) {
-      console.error('[GeoPrice] Relay error:', chrome.runtime.lastError.message);
-    }
-  });
+  try {
+    chrome.runtime.sendMessage(event.data, (response) => {
+      if (chrome.runtime.lastError) {
+        console.warn('[GeoPrice] Relay error:', chrome.runtime.lastError.message);
+      }
+    });
+  } catch (e) {
+    // Extension was reloaded — user needs to refresh this page
+    console.warn('[GeoPrice] Extension context invalidated. Please reload this page.');
+  }
 });
