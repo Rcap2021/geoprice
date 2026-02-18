@@ -370,9 +370,14 @@ class PriceEngine:
                 }).filter(h => h.name && h.price);
             }''')
             
+            # US Booking.com shows per-night prices; other locales show total stay price
+            nights = 1
+            if geo_code == "US" and intent.check_in and intent.check_out:
+                nights = max(1, (intent.check_out - intent.check_in).days)
+
             # Parse and normalize results
             for hotel in hotels:
-                price_value = self._parse_price(hotel["price"], geo_info["currency"])
+                price_value = self._parse_price(hotel["price"], geo_info["currency"]) * nights
                 if price_value > 0:
                     results.append({
                         "hotel_name": hotel["name"],
