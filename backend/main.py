@@ -15,7 +15,7 @@ import json
 import os
 from pathlib import Path
 
-from chat_service import ChatService
+from chat_service import ChatService, TravelIntent as ChatTravelIntent
 from price_engine import PriceEngine
 
 app = FastAPI(title="GeoPrice Travel API", version="1.0.0")
@@ -40,22 +40,7 @@ price_engine = PriceEngine()
 
 # ============== Models ==============
 
-class TravelIntent(BaseModel):
-    destination_city: Optional[str] = None
-    destination_country: Optional[str] = None
-    check_in: Optional[date] = None
-    check_out: Optional[date] = None
-    guests: int = 2
-    rooms: int = 1
-    hotel_tier: Optional[str] = None  # budget, mid-range, luxury, ultra-luxury
-    
-    def is_complete(self) -> bool:
-        return all([
-            self.destination_city,
-            self.check_in,
-            self.check_out,
-            self.hotel_tier
-        ])
+TravelIntent = ChatTravelIntent
 
 
 class ChatMessage(BaseModel):

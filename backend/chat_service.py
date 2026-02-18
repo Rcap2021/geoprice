@@ -23,6 +23,9 @@ class TravelIntent(BaseModel):
     rooms: int = 1
     hotel_tier: Optional[str] = None
 
+    def is_complete(self) -> bool:
+        return all([self.destination_city, self.check_in, self.check_out, self.hotel_tier])
+
 
 class ChatMessage(BaseModel):
     role: str
