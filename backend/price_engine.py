@@ -124,7 +124,7 @@ class PriceEngine:
     TIER_STARS = {
         "budget": [1, 2],
         "mid-range": [3],
-        "luxury": [4],
+        "luxury": [5],
         "ultra-luxury": [5],
     }
     
