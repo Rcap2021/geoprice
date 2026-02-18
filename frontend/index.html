@@ -182,6 +182,16 @@
 
             const handleBookCheapest = async () => {
                 setBrowseLoading(true);
+                // Open window synchronously during the user gesture — mobile browsers
+                // block window.open() called after an await (not seen as user-initiated)
+                const newTab = window.open('', '_blank');
+                if (newTab) {
+                    newTab.document.write(
+                        `<html><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f5f7ff">` +
+                        `<p style="color:#4f46e5;font-size:1.1rem">Opening ${deal.geo_country_name || deal.geo_country} browser, please wait…</p>` +
+                        `</body></html>`
+                    );
+                }
                 try {
                     const res = await fetch(`${API_BASE}/api/browse`, {
                         method: 'POST',
@@ -190,12 +200,18 @@
                     });
                     if (!res.ok) {
                         const err = await res.json();
+                        if (newTab) newTab.close();
                         alert(`Could not open browser: ${err.detail || 'Unknown error'}`);
                         return;
                     }
                     const data = await res.json();
-                    window.open(data.session_url, '_blank');
+                    if (newTab) {
+                        newTab.location.href = data.session_url;
+                    } else {
+                        window.open(data.session_url, '_blank');
+                    }
                 } catch (e) {
+                    if (newTab) newTab.close();
                     alert('Connection error. Please try again.');
                 } finally {
                     setBrowseLoading(false);
