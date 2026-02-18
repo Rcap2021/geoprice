@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "GeoPrice Travel",
+  "version": "1.0.0",
+  "description": "Book hotels at geo-targeted prices — instant, no remote browser needed.",
+  "permissions": ["proxy", "tabs", "storage", "webRequest", "webRequestAuthProvider"],
+  "host_permissions": [
+    "https://hotels.chatleg.ai/*",
+    "https://*.booking.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://hotels.chatleg.ai/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

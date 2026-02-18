@@ -120,6 +120,41 @@ class PriceEngine:
         "CAD": 1.36,
     }
     
+    # Direct proxy mapping from data.json (addr:port, no auth required)
+    # Only ports in 8000-9000 range; TR, TH, PT unavailable in this range
+    GEO_PROXIES = {
+        "BR": "79.127.137.165:8030",
+        "IN": "143.244.60.33:8099",
+        "AR": "143.244.61.209:8010",
+        "ID": "143.244.60.33:8101",
+        "PL": "79.127.248.200:8176",
+        "MX": "174.138.162.218:8142",
+        "ZA": "174.138.161.218:8200",
+        # US: no proxy needed — server is in the US
+        "GB": "131.153.1.42:8229",
+        "VN": "143.244.60.33:8237",
+        "MY": "143.244.60.33:8133",
+        "BD": "79.127.248.199:8018",
+        "PK": "79.127.248.199:8167",
+        "BG": "79.127.248.200:8033",
+        "SK": "79.127.248.199:8196",
+        "RS": "79.127.248.199:8192",
+        "HU": "79.127.248.199:8097",
+        "KZ": "79.127.248.200:8112",
+        "NG": "79.127.248.201:8161",
+        "MA": "143.244.60.33:8149",
+        "TN": "79.127.248.201:8221",
+        "PE": "79.127.248.199:8173",
+        "CL": "131.153.1.42:8043",
+        "JP": "131.153.163.154:8110",
+        "KR": "169.150.222.221:8116",
+        "SG": "79.127.248.200:8195",
+        "HK": "79.127.248.201:8096",
+        "FR": "174.138.161.194:8072",
+        "CA": "23.235.247.82:8038",
+        # TR, TH, PT: no entries with ports in 8000-9000 range
+    }
+
     # Hotel tier to star mapping for filtering
     TIER_STARS = {
         "budget": [1, 2],
@@ -188,12 +223,23 @@ class PriceEngine:
         if country_proxy:
             return {"server": country_proxy}
 
+        # Option 2: Direct proxy from GEO_PROXIES (no auth required)
+        if self.proxy_format == "direct":
+            # US baseline: the server itself is in the US — no proxy needed
+            if geo_code == "US":
+                return None
+            server = self.GEO_PROXIES.get(geo_code)
+            if server:
+                return {"server": f"http://{server}"}
+            print(f"[{geo_code}] No direct proxy entry, skipping")
+            return None
+
         # If no base URL configured, run without proxy (for testing)
         if not self.proxy_base_url:
             print(f"[{geo_code}] No proxy configured, using direct connection")
             return None
 
-        # Option 2: Viprox.net format
+        # Option 3: Viprox.net format
         # Username pattern: {base_user}-rc_{geo_lower}
         # e.g. chatleg-rc_us, chatleg-rc_br
         if self.proxy_format == "viprox":
@@ -241,10 +287,37 @@ class PriceEngine:
         rate = self.EXCHANGE_RATES.get(currency, 1.0)
         return round(amount / rate, 2)
     
+    async def _verify_proxy_country(self, context, geo_code: str) -> bool:
+        """
+        Verify the proxy is actually routing through the expected country.
+        - Correct country  → True
+        - Wrong country    → False (skip)
+        - ECONNREFUSED     → False (proxy is down, skip)
+        - Timeout / other  → True  (benefit of the doubt; booking.com may still work)
+        """
+        try:
+            resp = await context.request.get("https://ipinfo.io/json", timeout=8000)
+            data = await resp.json()
+            actual = data.get("country", "?").upper()
+            expected = geo_code.upper()
+            if actual == expected:
+                print(f"[{geo_code}] ✓ Proxy verified: IP {data.get('ip')} → {actual}")
+                return True
+            else:
+                print(f"[{geo_code}] ✗ Proxy wrong country: got {actual}, expected {expected} — skipping")
+                return False
+        except Exception as e:
+            err = str(e)
+            if "ECONNREFUSED" in err or "Connection refused" in err:
+                print(f"[{geo_code}] ✗ Proxy down (ECONNREFUSED) — skipping")
+                return False
+            print(f"[{geo_code}] IP check timed out ({err[:60]}) — proceeding anyway")
+            return True  # Timeout: booking.com may still be reachable
+
     async def _scrape_geo(
-        self, 
+        self,
         browser: Browser,
-        intent: TravelIntent, 
+        intent: TravelIntent,
         geo_code: str
     ) -> List[Dict[str, Any]]:
         """
@@ -252,7 +325,7 @@ class PriceEngine:
         """
         geo_info = self.GEO_COUNTRIES[geo_code]
         results = []
-        
+
         # Create context with geo-specific settings
         context_options = {
             "locale": geo_info["locale"],
@@ -265,15 +338,26 @@ class PriceEngine:
             ),
         }
 
-        # Add proxy if configured
+        # Add proxy if configured; in direct mode, skip geos with no entry
         proxy = self._get_proxy_for_geo(geo_code)
         if proxy:
             context_options["proxy"] = proxy
+        elif self.proxy_format == "direct" and geo_code != "US":
+            # No proxy available for this geo in direct mode — skip to avoid
+            # scraping with the server's own IP (which gives US prices)
+            print(f"[{geo_code}] No proxy available — skipping")
+            return []
 
         context = await browser.new_context(**context_options)
         page = await context.new_page()
 
         try:
+            # Verify proxy is routing through the correct country before scraping
+            if proxy:
+                ok = await self._verify_proxy_country(context, geo_code)
+                if not ok:
+                    return []
+
             # Set language header
             await page.set_extra_http_headers({
                 "Accept-Language": f"{geo_info['lang']},{geo_info['lang'][:2]};q=0.9,en;q=0.8",
@@ -320,11 +404,31 @@ class PriceEngine:
                     if (priceEl) {
                         price = priceEl.innerText.trim();
                         // Walk up to find a container that also holds taxes/fees text.
-                        // Booking.com often shows "+$45 taxes and fees" as a sibling/cousin of the price.
+                        // Booking.com shows tax text in the local language, so we match
+                        // keywords from all 32 supported country languages.
                         let container = priceEl.parentElement;
-                        for (let i = 0; i < 6 && container; i++) {
+                        for (let i = 0; i < 8 && container; i++) {
                             const text = container.innerText || '';
-                            const taxMatch = text.match(/\+\s*[^\d]*[\d.,]+[^\d]*(?:tax|fee|charge)/i);
+                            // Multilingual tax keywords:
+                            // EN: tax, fee, charge
+                            // ES (AR,MX,PE,CL): impuest(o/os), cargo(s), tasa(s)
+                            // PT (BR,PT): imposto(s), taxa(s)
+                            // FR (FR,MA,TN): taxe(s), frais
+                            // ID: pajak, biaya
+                            // HU: adó, díj
+                            // PL: podatek, opłat(a)
+                            // BG: данък, такса
+                            // SR/HR: porez, naknada
+                            // SK: daň
+                            // VI: thuế, phí
+                            // MS (MY): cukai
+                            // TR: vergi
+                            // KZ: салық
+                            // ZH (HK): 稅 / JA (JP): 税 / KO (KR): 세금 / TH: ภาษี
+                            // AR (MA,TN): ضريبة، رسوم
+                            const taxMatch = text.match(
+                                /\+\s*[^\d]*[\d.,]+[^\d]*(?:tax|fee|charge|impuest|cargo|tasa|imposto|taxa|taxe|frais|pajak|biaya|ad[oó]|d[ií]j|podatek|op[łl]at|данък|такса|porez|naknada|da[nň]|thu[eế]|ph[ií]|cukai|vergi|салық|稅|税|세금|ภาษี|ضريبة|رسوم)/iu
+                            );
                             if (taxMatch) {
                                 taxText = taxMatch[0];
                                 break;
@@ -384,9 +488,9 @@ class PriceEngine:
                 }).filter(h => h.name && h.price);
             }''')
             
-            # US Booking.com shows per-night prices; other locales show total stay price
+            # Booking.com shows per-night prices on all locales
             nights = 1
-            if geo_code == "US" and intent.check_in and intent.check_out:
+            if intent.check_in and intent.check_out:
                 nights = max(1, (intent.check_out - intent.check_in).days)
 
             # Parse and normalize results
@@ -499,21 +603,22 @@ class PriceEngine:
         return timezones.get(geo_code, "UTC")
     
     async def search_all_geos(
-        self, 
+        self,
         intent: TravelIntent,
         geos: Optional[List[str]] = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Search all geos and yield progress updates.
-        Returns an async generator for real-time updates.
+        US is scraped first as the sole baseline, then all other geos run in parallel.
+        Each other geo is verified via ipinfo.io before scraping.
         """
-        if geos is None:
-            geos = list(self.GEO_COUNTRIES.keys())
-        
-        total = len(geos)
+        all_geos = geos if geos is not None else list(self.GEO_COUNTRIES.keys())
+        # US is the baseline — scrape it first, separately
+        compare_geos = [g for g in all_geos if g != "US"]
+        total = len(compare_geos) + 1  # +1 for US baseline
         completed = []
         all_results = {}
-        
+
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=self.headless,
@@ -523,33 +628,38 @@ class PriceEngine:
                     '--no-sandbox',
                 ]
             )
-            
+
             try:
-                # Process geos with concurrency limit
+                # ── Step 1: Scrape US baseline first ──────────────────────────
+                us_results = await self._scrape_geo(browser, intent, "US")
+                completed.append("US")
+                all_results["US"] = us_results
+                yield {
+                    "progress": int(1 / total * 100),
+                    "geos_completed": completed.copy(),
+                    "geo": "US",
+                    "geo_results": us_results,
+                }
+
+                # ── Step 2: Scrape all comparison geos concurrently ───────────
                 semaphore = asyncio.Semaphore(self.max_concurrent)
-                
+
                 async def scrape_with_semaphore(geo: str):
                     async with semaphore:
                         return geo, await self._scrape_geo(browser, intent, geo)
-                
-                # Create tasks for all geos
-                tasks = [scrape_with_semaphore(geo) for geo in geos]
-                
-                # Process as they complete
+
+                tasks = [scrape_with_semaphore(geo) for geo in compare_geos]
                 for coro in asyncio.as_completed(tasks):
                     geo, results = await coro
                     completed.append(geo)
                     all_results[geo] = results
-                    
-                    progress = int((len(completed) / total) * 100)
-                    
                     yield {
-                        "progress": progress,
+                        "progress": int(len(completed) / total * 100),
                         "geos_completed": completed.copy(),
                         "geo": geo,
                         "geo_results": results,
                     }
-                
+
             finally:
                 await browser.close()
     
@@ -584,24 +694,33 @@ class PriceEngine:
         
         for hotel_id, hotel_data in hotels_by_id.items():
             prices = hotel_data["prices"]
-            
+
             if not prices:
                 continue
-            
-            # Find cheapest geo
-            cheapest_geo = min(prices.keys(), key=lambda g: prices[g]["usd_price"])
-            cheapest = prices[cheapest_geo]
-            
-            # Get baseline price — fall back to US, then first available
-            # (baseline_geo may be an unsupported country not in scraped results)
-            effective_baseline_geo = baseline_geo if baseline_geo in prices else ("US" if "US" in prices else list(prices.keys())[0])
+
+            # Don't show a deal until the baseline country has been scraped —
+            # avoids wild swings from using a random early-arriving geo as baseline
+            effective_baseline_geo = baseline_geo if baseline_geo in prices else ("US" if "US" in prices else None)
+            if effective_baseline_geo is None:
+                continue
             baseline = prices[effective_baseline_geo]
             baseline_price = baseline["usd_price"]
-            
+
+            # Skip obviously bad baseline prices (parse failure → near-zero)
+            if baseline_price < 5:
+                continue
+
+            # Find cheapest geo, excluding any with suspiciously low prices
+            valid_prices = {g: p for g, p in prices.items() if p["usd_price"] >= 5}
+            if not valid_prices:
+                continue
+            cheapest_geo = min(valid_prices.keys(), key=lambda g: valid_prices[g]["usd_price"])
+            cheapest = valid_prices[cheapest_geo]
+
             # Calculate savings
             savings_usd = baseline_price - cheapest["usd_price"]
             savings_percent = (savings_usd / baseline_price * 100) if baseline_price > 0 else 0
-            
+
             # Only include if there are actual savings
             if savings_percent >= 1:  # At least 1% savings
                 best_deals.append({

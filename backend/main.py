@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from uuid import uuid4, UUID
 import asyncio
 import json
@@ -17,6 +17,9 @@ import re
 import secrets
 import subprocess
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
 
 from chat_service import ChatService, TravelIntent as ChatTravelIntent
 from price_engine import PriceEngine
@@ -35,6 +38,7 @@ app.add_middleware(
 # In-memory storage (replace with PostgreSQL in production)
 conversations: Dict[str, dict] = {}
 searches: Dict[str, dict] = {}
+proxy_tokens: Dict[str, dict] = {}  # token → { geo_code, proxy_addr, expires_at }
 
 # Browser session pool — ports 16080-16099 (20 slots, POOL_SIZE pre-warmed)
 BROWSER_PORTS = list(range(16080, 16100))
@@ -94,6 +98,191 @@ async def _start_warm_slot(slot_index: int):
     await warm_queue.put(slot_index)
 
 
+# ============== CONNECT Relay Proxy ==============
+
+async def _proxy_read_request(reader: asyncio.StreamReader):
+    """Read one HTTP request line + headers. Returns (method, target, headers_dict)."""
+    try:
+        request_line = await asyncio.wait_for(reader.readline(), timeout=10)
+    except asyncio.TimeoutError:
+        return None, None, {}
+    request_line = request_line.decode("utf-8", errors="replace").strip()
+    if not request_line:
+        return None, None, {}
+    parts = request_line.split(" ", 2)
+    if len(parts) < 2:
+        return None, None, {}
+    method, target = parts[0].upper(), parts[1]
+    headers: dict = {}
+    while True:
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=10)
+        except asyncio.TimeoutError:
+            break
+        decoded = line.decode("utf-8", errors="replace").strip()
+        if not decoded:
+            break
+        if ":" in decoded:
+            k, _, v = decoded.partition(":")
+            headers[k.strip().lower()] = v.strip()
+    return method, target, headers
+
+
+async def _proxy_pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
+    """Pipe bytes from src to dst until EOF or error."""
+    try:
+        while True:
+            data = await src.read(65536)
+            if not data:
+                break
+            dst.write(data)
+            await dst.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            dst.close()
+        except Exception:
+            pass
+
+
+async def _proxy_handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """Handle one browser connection to the CONNECT relay proxy on port 8766."""
+    import base64
+
+    geo_writer = None
+    try:
+        method, target, headers = await _proxy_read_request(reader)
+
+        if method != "CONNECT":
+            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            return
+
+        proxy_auth = headers.get("proxy-authorization", "")
+
+        if not proxy_auth:
+            # Challenge the browser — Chrome will fire onAuthRequired in the extension
+            writer.write(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                b"Proxy-Authenticate: Basic realm=\"GeoPrice\"\r\n"
+                b"Content-Length: 0\r\n"
+                b"Proxy-Connection: keep-alive\r\n"
+                b"\r\n"
+            )
+            await writer.drain()
+            # Browser retries on the same connection with credentials
+            try:
+                method2, target2, headers2 = await asyncio.wait_for(
+                    _proxy_read_request(reader), timeout=15
+                )
+                if method2 == "CONNECT":
+                    target, headers = target2, headers2
+                    proxy_auth = headers2.get("proxy-authorization", "")
+            except asyncio.TimeoutError:
+                return
+
+        if not proxy_auth or not proxy_auth.lower().startswith("basic "):
+            writer.write(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                b"Proxy-Authenticate: Basic realm=\"GeoPrice\"\r\n"
+                b"Content-Length: 0\r\n\r\n"
+            )
+            await writer.drain()
+            return
+
+        # Decode Basic auth → token:x
+        try:
+            creds = base64.b64decode(proxy_auth[6:]).decode("utf-8", errors="replace")
+            token = creds.split(":")[0]
+        except Exception:
+            writer.write(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"GeoPrice\"\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            return
+
+        # Validate token
+        entry = proxy_tokens.get(token)
+        if not entry or datetime.utcnow() > entry["expires_at"]:
+            writer.write(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"GeoPrice\"\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            return
+
+        proxy_addr = entry["proxy_addr"]   # "host:port"
+        proxy_host, proxy_port_str = proxy_addr.rsplit(":", 1)
+        proxy_port = int(proxy_port_str)
+
+        # Connect to the geo proxy
+        try:
+            geo_reader, geo_writer = await asyncio.wait_for(
+                asyncio.open_connection(proxy_host, proxy_port), timeout=15
+            )
+        except Exception as e:
+            print(f"[Relay] Cannot reach geo proxy {proxy_addr}: {e}")
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            return
+
+        # Forward CONNECT to geo proxy (it's an HTTP proxy that supports CONNECT)
+        geo_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+        await geo_writer.drain()
+
+        # Read geo proxy's response to our CONNECT
+        try:
+            geo_status = await asyncio.wait_for(geo_reader.readline(), timeout=15)
+            # drain remaining headers
+            while True:
+                line = await asyncio.wait_for(geo_reader.readline(), timeout=5)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+        except asyncio.TimeoutError:
+            writer.write(b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            return
+
+        if b"200" not in geo_status:
+            print(f"[Relay] Geo proxy refused CONNECT to {target}: {geo_status.strip()}")
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            return
+
+        # Tell the browser the tunnel is open
+        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        await writer.drain()
+
+        # Bidirectional pipe until either side closes
+        await asyncio.gather(
+            _proxy_pipe(reader, geo_writer),
+            _proxy_pipe(geo_reader, writer),
+            return_exceptions=True,
+        )
+
+    except Exception as e:
+        print(f"[Relay] Unexpected error: {e}")
+        try:
+            writer.write(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+        except Exception:
+            pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+        if geo_writer:
+            try:
+                geo_writer.close()
+            except Exception:
+                pass
+
+
+async def _start_connect_proxy():
+    RELAY_PORT = int(os.getenv("PROXY_RELAY_PORT", "8766"))
+    server = await asyncio.start_server(_proxy_handle_client, "0.0.0.0", RELAY_PORT)
+    addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
+    print(f"[Relay] CONNECT proxy listening on {addrs}")
+    asyncio.create_task(server.serve_forever())
+
+
 @app.on_event("startup")
 async def startup_browser_pool():
     """Stop leftover containers from previous runs, then pre-warm the pool."""
@@ -108,6 +297,7 @@ async def startup_browser_pool():
         pass
     for i in range(POOL_SIZE):
         asyncio.create_task(_start_warm_slot(i))
+    asyncio.create_task(_start_connect_proxy())
 
 
 # ============== Models ==============
@@ -143,6 +333,10 @@ class SearchTriggerRequest(BaseModel):
 class BrowseRequest(BaseModel):
     url: str
     country: str  # e.g. "MY", "IN", "BR"
+
+
+class ProxyTokenRequest(BaseModel):
+    geo_country: str
 
 
 class ChatResponse(BaseModel):
@@ -393,7 +587,13 @@ async def run_price_search(search_id: str, intent: TravelIntent, baseline_geo: s
 
 def _build_proxy_url_for_geo(geo_code: str) -> str:
     """Build a full proxy URL for a given country code."""
-    proxy_format = os.getenv("PROXY_FORMAT", "viprox")
+    from price_engine import PriceEngine
+    proxy_format = os.getenv("PROXY_FORMAT", "direct")
+
+    if proxy_format == "direct":
+        server = PriceEngine.GEO_PROXIES.get(geo_code)
+        return f"http://{server}" if server else ""
+
     proxy_base_url = os.getenv("PROXY_BASE_URL", "")
     proxy_username = os.getenv("PROXY_USERNAME", "")
     proxy_password = os.getenv("PROXY_PASSWORD", "")
@@ -404,13 +604,47 @@ def _build_proxy_url_for_geo(geo_code: str) -> str:
     geo_lower = geo_code.lower()
 
     if proxy_format == "viprox":
-        # e.g. http://chatleg-rc_my:password@gw-magic.viprox.net:7383
         host_part = proxy_base_url.replace("http://", "").replace("https://", "")
         scheme = "https" if proxy_base_url.startswith("https://") else "http"
         geo_username = f"{proxy_username}-rc_{geo_lower}"
         return f"{scheme}://{geo_username}:{proxy_password}@{host_part}"
 
     return proxy_base_url
+
+
+@app.post("/api/proxy-token")
+async def create_proxy_token(request: ProxyTokenRequest):
+    """Issue a short-lived token that the Chrome extension exchanges for a PAC script."""
+    geo = request.geo_country.upper()
+    proxy_addr = PriceEngine.GEO_PROXIES.get(geo)
+    if not geo or not proxy_addr:
+        raise HTTPException(status_code=400, detail="Unsupported geo or no proxy available")
+    token = secrets.token_urlsafe(32)
+    proxy_tokens[token] = {
+        "geo_code": geo,
+        "proxy_addr": proxy_addr,
+        "expires_at": datetime.utcnow() + timedelta(minutes=30),
+    }
+    return {"token": token, "ttl": 1800}
+
+
+@app.get("/api/pac/{token}")
+async def get_pac_script(token: str):
+    """Return a PAC script routing booking.com through the server relay proxy (token-gated)."""
+    entry = proxy_tokens.get(token)
+    if not entry or datetime.utcnow() > entry["expires_at"]:
+        raise HTTPException(status_code=404, detail="Invalid or expired token")
+    relay_host = os.getenv("PROXY_RELAY_HOST", "hotels.chatleg.ai")
+    relay_port = int(os.getenv("PROXY_RELAY_PORT", "8766"))
+    pac = (
+        f'function FindProxyForURL(url, host) {{\n'
+        f'  if (shExpMatch(host, "*.booking.com") || host === "booking.com") {{\n'
+        f'    return "PROXY {relay_host}:{relay_port}";\n'
+        f'  }}\n'
+        f'  return "DIRECT";\n'
+        f'}}'
+    )
+    return {"pac": pac, "geo": entry["geo_code"]}
 
 
 @app.post("/api/browse")
@@ -431,14 +665,16 @@ async def browse(request: BrowseRequest):
     port = BROWSER_PORTS[slot_index]
     proxy_url = _build_proxy_url_for_geo(request.country)
 
-    # Parse proxy credentials and build relay args.
-    # Chromium's --proxy-server flag does not honour embedded credentials,
-    # so we start a local relay inside the container that adds Basic auth.
+    # Build proxy args for Chromium.
+    # Direct proxies (no auth): pass --proxy-server directly.
+    # Auth proxies: start a local relay inside the container (Chromium ignores
+    # credentials embedded in the proxy URL).
     relay_cmd = ""
     proxy_arg = ""
     if proxy_url:
         m = re.match(r'https?://([^:]+):([^@]+)@(.+)', proxy_url)
         if m:
+            # Auth proxy — use relay
             user, password, hostport = m.groups()
             relay_cmd = (
                 f"pkill -f proxy-relay.py 2>/dev/null || true; "
@@ -446,32 +682,58 @@ async def browse(request: BrowseRequest):
                 "sleep 0.5; "
             )
             proxy_arg = "--proxy-server=http://127.0.0.1:18080"
+        else:
+            # No-auth direct proxy — pass URL straight to Chromium
+            proxy_arg = f"--proxy-server={proxy_url}"
 
-    # Force English UI and USD pricing regardless of geo proxy location
+    # Use the geo's local currency so Booking.com applies the correct pricing tier.
+    # Forcing USD here causes Booking.com to show US-tier prices, wiping out the discount.
+    from price_engine import PriceEngine
     url = request.url
     if 'booking.com' in url:
         sep = '&' if '?' in url else '?'
         if 'selected_currency=' not in url:
-            url += f'{sep}selected_currency=USD'
+            geo_currency = PriceEngine.GEO_COUNTRIES.get(request.country, {}).get("currency", "USD")
+            url += f'{sep}selected_currency={geo_currency}'
             sep = '&'
         if 'lang=' not in url:
             url += f'{sep}lang=en-us'
 
     safe_url = url.replace("'", "%27")
+
+    # Kill all chromium processes inside the container.
+    # pkill is not available in this image, so we use Python (which is present).
+    # Match only the binary path (first null-delimited arg) to avoid killing
+    # our own bash/python process that mentions "chromium" in its arguments.
+    kill_chromium = (
+        "python3 -c \""
+        "import os,glob\n"
+        "for f in glob.glob('/proc/*/cmdline'):\n"
+        " try:\n"
+        "  args=open(f,'rb').read().split(b'\\x00')\n"
+        "  if args and b'chromium' in args[0]:\n"
+        "   os.kill(int(f.split('/')[2]),9)\n"
+        " except: pass\n"
+        "\" 2>/dev/null; sleep 1; "
+    )
+
     nav_script = (
         relay_cmd +
-        "pkill -f chromium || true; "
-        "sleep 0.3; "
+        kill_chromium +
         f"DISPLAY=:1 /usr/bin/chromium "
         "--no-sandbox --disable-dev-shm-usage --disable-gpu "
         "--disable-blink-features=AutomationControlled "
         "--window-size=1280,900 --start-maximized "
+        "--no-first-run --disable-infobars "
+        "--user-data-dir=/tmp/chrome-geo-session "
         f"--ignore-certificate-errors {proxy_arg} '{safe_url}' &"
     )
-    subprocess.run(
+    result = subprocess.run(
         ["docker", "exec", "-d", container_name, "bash", "-c", nav_script],
-        capture_output=True, timeout=5
+        capture_output=True, timeout=10, text=True
     )
+    if result.returncode != 0:
+        print(f"[browse] docker exec failed (rc={result.returncode}): {result.stderr[:200]}")
 
     session_id = secrets.token_hex(8)
     slot_status[slot_index] = "active"
