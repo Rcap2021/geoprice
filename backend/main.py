@@ -13,6 +13,7 @@ from uuid import uuid4, UUID
 import asyncio
 import json
 import os
+import re
 import secrets
 import subprocess
 from pathlib import Path
@@ -35,14 +36,78 @@ app.add_middleware(
 conversations: Dict[str, dict] = {}
 searches: Dict[str, dict] = {}
 
-# Browser session pool — ports 16080-16099 (20 concurrent sessions)
+# Browser session pool — ports 16080-16099 (20 slots, POOL_SIZE pre-warmed)
 BROWSER_PORTS = list(range(16080, 16100))
+POOL_SIZE = 5  # containers kept warm and ready at all times
 browser_sessions: Dict[str, dict] = {}
-browser_port_lock = asyncio.Lock()
+slot_containers: Dict[int, str] = {}   # slot_index -> container_name
+slot_status: Dict[int, str] = {}       # "warming" | "warm" | "active" | "free"
+warm_queue: asyncio.Queue = asyncio.Queue()  # slot indices ready to hand out
 
 # Services
 chat_service = ChatService()
 price_engine = PriceEngine()
+
+
+# ============== Browser Pool ==============
+
+async def _start_warm_slot(slot_index: int):
+    """Start a warm (idle, about:blank) browser container at the given slot."""
+    import httpx
+    port = BROWSER_PORTS[slot_index]
+    container_name = f"browse_warm_{slot_index}"
+    slot_status[slot_index] = "warming"
+    slot_containers[slot_index] = container_name
+
+    # Remove any existing container at this slot
+    subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, timeout=10)
+
+    cmd = [
+        "docker", "run", "-d", "--rm",
+        "--name", container_name,
+        "-p", f"127.0.0.1:{port}:6080",
+        "-e", "START_URL=about:blank",
+        "--memory=512m", "--cpus=0.5",
+        "geoprice-browser"
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            slot_status[slot_index] = "free"
+            return
+    except Exception:
+        slot_status[slot_index] = "free"
+        return
+
+    # Wait for websockify to serve HTTP (up to 30s)
+    async with httpx.AsyncClient() as client:
+        for _ in range(60):
+            await asyncio.sleep(0.5)
+            try:
+                resp = await client.get(f"http://127.0.0.1:{port}/vnc.html", timeout=2.0)
+                if resp.status_code == 200:
+                    break
+            except Exception:
+                continue
+
+    slot_status[slot_index] = "warm"
+    await warm_queue.put(slot_index)
+
+
+@app.on_event("startup")
+async def startup_browser_pool():
+    """Stop leftover containers from previous runs, then pre-warm the pool."""
+    try:
+        ps = subprocess.run(
+            ["docker", "ps", "-q", "--filter", "ancestor=geoprice-browser"],
+            capture_output=True, text=True, timeout=10
+        )
+        for cid in ps.stdout.split():
+            subprocess.run(["docker", "stop", cid], capture_output=True, timeout=10)
+    except Exception:
+        pass
+    for i in range(POOL_SIZE):
+        asyncio.create_task(_start_warm_slot(i))
 
 
 # ============== Models ==============
@@ -351,92 +416,82 @@ def _build_proxy_url_for_geo(geo_code: str) -> str:
 @app.post("/api/browse")
 async def browse(request: BrowseRequest):
     """
-    Spawn a geo-targeted remote browser (Docker + noVNC) for a given URL and country.
+    Route user to a pre-warmed geo-targeted remote browser (Docker + noVNC).
     Returns a session URL pointing to the noVNC web UI through nginx.
     """
-    async with browser_port_lock:
-        # Also check ports actually bound by Docker (survives backend restarts)
-        try:
-            ps = subprocess.run(
-                ["docker", "ps", "--format", "{{.Ports}}"],
-                capture_output=True, text=True, timeout=5
+    try:
+        slot_index = warm_queue.get_nowait()
+    except asyncio.QueueEmpty:
+        raise HTTPException(
+            status_code=503,
+            detail="No browser sessions available right now. Please try again in a moment."
+        )
+
+    container_name = slot_containers[slot_index]
+    port = BROWSER_PORTS[slot_index]
+    proxy_url = _build_proxy_url_for_geo(request.country)
+
+    # Parse proxy credentials and build relay args.
+    # Chromium's --proxy-server flag does not honour embedded credentials,
+    # so we start a local relay inside the container that adds Basic auth.
+    relay_cmd = ""
+    proxy_arg = ""
+    if proxy_url:
+        m = re.match(r'https?://([^:]+):([^@]+)@(.+)', proxy_url)
+        if m:
+            user, password, hostport = m.groups()
+            relay_cmd = (
+                f"pkill -f proxy-relay.py 2>/dev/null || true; "
+                f"python3 /usr/local/bin/proxy-relay.py 18080 {hostport} {user}:{password} & "
+                "sleep 0.5; "
             )
-            docker_ports = set()
-            for line in ps.stdout.splitlines():
-                for segment in line.split(","):
-                    segment = segment.strip()
-                    if "127.0.0.1:" in segment:
-                        try:
-                            docker_ports.add(int(segment.split("127.0.0.1:")[1].split("->")[0]))
-                        except (IndexError, ValueError):
-                            pass
-        except Exception:
-            docker_ports = set()
+            proxy_arg = "--proxy-server=http://127.0.0.1:18080"
 
-        used_ports = {s["port"] for s in browser_sessions.values()} | docker_ports
-        free_ports = [p for p in BROWSER_PORTS if p not in used_ports]
-        if not free_ports:
-            raise HTTPException(
-                status_code=503,
-                detail="All browser sessions are in use. Please try again in a few minutes."
-            )
-        port = free_ports[0]
-        slot_index = BROWSER_PORTS.index(port)
+    # Force English UI and USD pricing regardless of geo proxy location
+    url = request.url
+    if 'booking.com' in url:
+        sep = '&' if '?' in url else '?'
+        if 'selected_currency=' not in url:
+            url += f'{sep}selected_currency=USD'
+            sep = '&'
+        if 'lang=' not in url:
+            url += f'{sep}lang=en-us'
 
-        session_id = secrets.token_hex(8)
-        container_name = f"browse_{session_id}"
+    safe_url = url.replace("'", "%27")
+    nav_script = (
+        relay_cmd +
+        "pkill -f chromium || true; "
+        "sleep 0.3; "
+        f"DISPLAY=:1 /usr/bin/chromium "
+        "--no-sandbox --disable-dev-shm-usage --disable-gpu "
+        "--disable-blink-features=AutomationControlled "
+        "--window-size=1280,900 --start-maximized "
+        f"--ignore-certificate-errors {proxy_arg} '{safe_url}' &"
+    )
+    subprocess.run(
+        ["docker", "exec", "-d", container_name, "bash", "-c", nav_script],
+        capture_output=True, timeout=5
+    )
 
-        proxy_url = _build_proxy_url_for_geo(request.country)
+    session_id = secrets.token_hex(8)
+    slot_status[slot_index] = "active"
+    browser_sessions[session_id] = {
+        "port": port,
+        "slot": slot_index,
+        "container_name": container_name,
+        "country": request.country,
+        "url": request.url,
+        "started_at": datetime.utcnow().isoformat(),
+    }
 
-        docker_cmd = [
-            "docker", "run", "-d", "--rm",
-            "--name", container_name,
-            "-p", f"127.0.0.1:{port}:6080",
-            "-e", f"PROXY_URL={proxy_url}",
-            "-e", f"START_URL={request.url}",
-            "--memory=512m",
-            "--cpus=0.5",
-            "geoprice-browser"
-        ]
+    # Schedule cleanup and pool replenishment after 30 minutes
+    asyncio.create_task(_cleanup_and_replenish(session_id, slot_index, delay=1800))
 
-        try:
-            result = subprocess.run(
-                docker_cmd,
-                capture_output=True,
-                text=True,
-                timeout=15
-            )
-            if result.returncode != 0:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to start browser: {result.stderr.strip()}"
-                )
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=500, detail="Docker launch timed out")
-
-        browser_sessions[session_id] = {
-            "port": port,
-            "slot": slot_index,
-            "container_name": container_name,
-            "country": request.country,
-            "url": request.url,
-            "started_at": datetime.utcnow().isoformat(),
-        }
-
-    # Wait until noVNC/websockify is actually accepting connections (max 15s)
-    import socket
-    for _ in range(30):
-        await asyncio.sleep(0.5)
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=1):
-                break
-        except (ConnectionRefusedError, OSError):
-            continue
-
-    # Schedule cleanup after 30 minutes (outside the lock)
-    asyncio.create_task(_cleanup_browser_session(session_id, container_name, delay=1800))
-
-    session_url = f"/browse/s{slot_index}/vnc.html?autoconnect=true&resize=scale"
+    # Fix: pass path so noVNC WebSocket connects through the right nginx location
+    session_url = (
+        f"/browse/s{slot_index}/vnc.html"
+        f"?autoconnect=true&resize=scale&path=browse/s{slot_index}/"
+    )
     return {
         "session_url": session_url,
         "session_id": session_id,
@@ -444,14 +499,17 @@ async def browse(request: BrowseRequest):
     }
 
 
-async def _cleanup_browser_session(session_id: str, container_name: str, delay: int = 1800):
-    """Stop a browser container and release its port slot after `delay` seconds."""
+async def _cleanup_and_replenish(session_id: str, slot_index: int, delay: int = 1800):
+    """Stop the used browser container after delay, then warm a fresh one at that slot."""
     await asyncio.sleep(delay)
+    browser_sessions.pop(session_id, None)
+    container_name = slot_containers.get(slot_index, "")
     try:
         subprocess.run(["docker", "stop", container_name], timeout=10, capture_output=True)
     except Exception:
         pass
-    browser_sessions.pop(session_id, None)
+    slot_status[slot_index] = "free"
+    asyncio.create_task(_start_warm_slot(slot_index))
 
 
 # ============== Health Check ==============

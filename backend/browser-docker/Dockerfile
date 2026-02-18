@@ -29,7 +29,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY start-chromium.sh /usr/local/bin/start-chromium.sh
-RUN chmod +x /usr/local/bin/start-chromium.sh
+COPY proxy-relay.py /usr/local/bin/proxy-relay.py
+RUN chmod +x /usr/local/bin/start-chromium.sh /usr/local/bin/proxy-relay.py
 
 EXPOSE 6080
 
