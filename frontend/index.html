@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GeoPrice Travel - Find the Best Hotel Deals Worldwide</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .chat-gradient { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+        .glass { background: rgba(255, 255, 255, 0.1); backdrop-filter: blur(10px); }
+        .typing-dot { animation: typing 1.4s infinite; }
+        .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+        .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes typing {
+            0%, 60%, 100% { transform: translateY(0); }
+            30% { transform: translateY(-5px); }
+        }
+        .deal-card:hover { transform: translateY(-2px); }
+        .progress-bar { transition: width 0.5s ease-out; }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        // API Configuration
+        const API_BASE = 'http://localhost:8000';
+
+        // ============== Components ==============
+
+        // Chat Message Bubble
+        function ChatMessage({ message, isUser }) {
+            return (
+                <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-4`}>
+                    <div className={`max-w-[80%] rounded-2xl px-4 py-3 ${
+                        isUser 
+                            ? 'bg-indigo-600 text-white rounded-br-md' 
+                            : 'bg-white text-gray-800 shadow-sm border border-gray-100 rounded-bl-md'
+                    }`}>
+                        <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.content}</p>
+                        <p className={`text-xs mt-1 ${isUser ? 'text-indigo-200' : 'text-gray-400'}`}>
+                            {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </p>
+                    </div>
+                </div>
+            );
+        }
+
+        // Typing Indicator
+        function TypingIndicator() {
+            return (
+                <div className="flex justify-start mb-4">
+                    <div className="bg-white rounded-2xl rounded-bl-md px-4 py-3 shadow-sm border border-gray-100">
+                        <div className="flex space-x-1">
+                            <div className="w-2 h-2 bg-gray-400 rounded-full typing-dot"></div>
+                            <div className="w-2 h-2 bg-gray-400 rounded-full typing-dot"></div>
+                            <div className="w-2 h-2 bg-gray-400 rounded-full typing-dot"></div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // Intent Summary Card
+        function IntentCard({ intent }) {
+            if (!intent.destination_city) return null;
+            
+            const formatDate = (dateStr) => {
+                if (!dateStr) return '---';
+                return new Date(dateStr).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+            };
+
+            return (
+                <div className="bg-gradient-to-r from-indigo-500 to-purple-600 rounded-xl p-4 text-white mb-4 shadow-lg">
+                    <h3 className="font-semibold mb-2 flex items-center">
+                        <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z" />
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+                        </svg>
+                        Your Trip
+                    </h3>
+                    <div className="grid grid-cols-2 gap-2 text-sm">
+                        <div>
+                            <span className="text-indigo-200">Destination:</span>
+                            <p className="font-medium">{intent.destination_city || '---'}</p>
+                        </div>
+                        <div>
+                            <span className="text-indigo-200">Hotel Type:</span>
+                            <p className="font-medium capitalize">{intent.hotel_tier || '---'}</p>
+                        </div>
+                        <div>
+                            <span className="text-indigo-200">Check-in:</span>
+                            <p className="font-medium">{formatDate(intent.check_in)}</p>
+                        </div>
+                        <div>
+                            <span className="text-indigo-200">Check-out:</span>
+                            <p className="font-medium">{formatDate(intent.check_out)}</p>
+                        </div>
+                        <div>
+                            <span className="text-indigo-200">Guests:</span>
+                            <p className="font-medium">{intent.guests}</p>
+                        </div>
+                        <div>
+                            <span className="text-indigo-200">Rooms:</span>
+                            <p className="font-medium">{intent.rooms}</p>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // Search Progress
+        function SearchProgress({ searchId, onComplete }) {
+            const [status, setStatus] = useState('connecting');
+            const [progress, setProgress] = useState(0);
+            const [geosCompleted, setGeosCompleted] = useState([]);
+            const [geosTotal, setGeosTotal] = useState(12);
+            const [bestDeals, setBestDeals] = useState([]);
+
+            useEffect(() => {
+                if (!searchId) return;
+
+                const ws = new WebSocket(`ws://localhost:8000/api/search/${searchId}/stream`);
+
+                ws.onopen = () => setStatus('searching');
+                
+                ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    setProgress(data.progress || 0);
+                    setGeosCompleted(data.geos_completed || []);
+                    setGeosTotal(data.geos_total || 12);
+                    
+                    if (data.best_deals) {
+                        setBestDeals(data.best_deals);
+                    }
+                    
+                    if (data.completed || data.status === 'completed') {
+                        setStatus('completed');
+                        onComplete(data.best_deals || []);
+                        ws.close();
+                    }
+                };
+
+                ws.onerror = () => {
+                    setStatus('error');
+                    // Fallback to polling
+                    pollResults(searchId);
+                };
+
+                return () => ws.close();
+            }, [searchId]);
+
+            const pollResults = async (id) => {
+                const interval = setInterval(async () => {
+                    try {
+                        const res = await fetch(`${API_BASE}/api/search/${id}`);
+                        const data = await res.json();
+                        setProgress(data.progress || 0);
+                        setGeosCompleted(data.geos_completed || []);
+                        
+                        if (data.status === 'completed') {
+                            clearInterval(interval);
+                            setStatus('completed');
+                            onComplete(data.best_deals || []);
+                        }
+                    } catch (e) {
+                        console.error('Poll error:', e);
+                    }
+                }, 2000);
+            };
+
+            const countryFlags = {
+                'BR': '🇧🇷', 'IN': '🇮🇳', 'AR': '🇦🇷', 'TR': '🇹🇷',
+                'ID': '🇮🇩', 'TH': '🇹🇭', 'PL': '🇵🇱', 'MX': '🇲🇽',
+                'ZA': '🇿🇦', 'PT': '🇵🇹', 'US': '🇺🇸', 'GB': '🇬🇧'
+            };
+
+            return (
+                <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-100 mb-4">
+                    <div className="flex items-center justify-between mb-4">
+                        <h3 className="font-semibold text-gray-800">
+                            {status === 'searching' ? '🔍 Searching worldwide prices...' : 
+                             status === 'completed' ? '✅ Search complete!' : 
+                             status === 'error' ? '⚠️ Checking prices...' : 
+                             '⏳ Connecting...'}
+                        </h3>
+                        <span className="text-sm text-gray-500">{progress}%</span>
+                    </div>
+                    
+                    <div className="w-full bg-gray-200 rounded-full h-2 mb-4">
+                        <div 
+                            className="bg-gradient-to-r from-indigo-500 to-purple-600 h-2 rounded-full progress-bar"
+                            style={{ width: `${progress}%` }}
+                        ></div>
+                    </div>
+                    
+                    <div className="flex flex-wrap gap-2">
+                        {Object.keys(countryFlags).map(geo => (
+                            <span 
+                                key={geo}
+                                className={`text-lg transition-all ${
+                                    geosCompleted.includes(geo) ? 'opacity-100' : 'opacity-30 grayscale'
+                                }`}
+                                title={geo}
+                            >
+                                {countryFlags[geo]}
+                            </span>
+                        ))}
+                    </div>
+                    
+                    {bestDeals.length > 0 && status !== 'completed' && (
+                        <div className="mt-4 pt-4 border-t border-gray-100">
+                            <p className="text-sm text-gray-600">
+                                🎉 Found {bestDeals.length} deals with savings so far!
+                            </p>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // Deal Card
+        function DealCard({ deal }) {
+            const stars = '⭐'.repeat(deal.stars || 0);
+            
+            return (
+                <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-100 deal-card transition-all hover:shadow-md">
+                    <div className="flex justify-between items-start mb-2">
+                        <div className="flex-1">
+                            <h4 className="font-semibold text-gray-800 leading-tight">{deal.hotel_name}</h4>
+                            <p className="text-xs text-gray-500 mt-1">{deal.location}</p>
+                            {deal.stars && <p className="text-xs mt-1">{stars}</p>}
+                        </div>
+                        <div className="bg-green-100 text-green-700 px-2 py-1 rounded-full text-xs font-semibold">
+                            Save {deal.savings_percent}%
+                        </div>
+                    </div>
+                    
+                    <div className="flex items-end justify-between mt-3">
+                        <div>
+                            <p className="text-xs text-gray-500 line-through">${deal.baseline_usd_price}</p>
+                            <p className="text-2xl font-bold text-gray-800">${deal.usd_price}</p>
+                            <p className="text-xs text-gray-500">
+                                via {deal.geo_country_name} ({deal.geo_currency} {deal.geo_price.toLocaleString()})
+                            </p>
+                        </div>
+                        <a 
+                            href={deal.booking_url} 
+                            target="_blank" 
+                            rel="noopener noreferrer"
+                            className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                        >
+                            Book Now
+                        </a>
+                    </div>
+                    
+                    <div className="flex gap-2 mt-3">
+                        {deal.free_cancellation && (
+                            <span className="text-xs bg-blue-50 text-blue-700 px-2 py-1 rounded">Free cancellation</span>
+                        )}
+                        {deal.includes_breakfast && (
+                            <span className="text-xs bg-orange-50 text-orange-700 px-2 py-1 rounded">Breakfast included</span>
+                        )}
+                        {deal.review_score && (
+                            <span className="text-xs bg-yellow-50 text-yellow-700 px-2 py-1 rounded">
+                                {deal.review_score} rating
+                            </span>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        // Results Panel
+        function ResultsPanel({ deals }) {
+            if (!deals || deals.length === 0) {
+                return (
+                    <div className="text-center py-8 text-gray-500">
+                        <p>No deals found yet. Start a search to see results!</p>
+                    </div>
+                );
+            }
+
+            const totalSavings = deals.reduce((sum, d) => sum + d.savings_usd, 0);
+            const avgSavings = deals.reduce((sum, d) => sum + d.savings_percent, 0) / deals.length;
+
+            return (
+                <div>
+                    <div className="bg-gradient-to-r from-green-500 to-emerald-600 rounded-xl p-4 text-white mb-4">
+                        <h3 className="font-semibold mb-2">💰 Savings Summary</h3>
+                        <div className="grid grid-cols-2 gap-4 text-sm">
+                            <div>
+                                <p className="text-green-100">Best Deals Found</p>
+                                <p className="text-2xl font-bold">{deals.length}</p>
+                            </div>
+                            <div>
+                                <p className="text-green-100">Avg. Savings</p>
+                                <p className="text-2xl font-bold">{avgSavings.toFixed(1)}%</p>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div className="space-y-3 max-h-[500px] overflow-y-auto pr-2">
+                        {deals.map((deal, idx) => (
+                            <DealCard key={deal.hotel_id || idx} deal={deal} />
+                        ))}
+                    </div>
+                </div>
+            );
+        }
+
+        // Quick Replies
+        function QuickReplies({ onSelect, suggestions }) {
+            return (
+                <div className="flex flex-wrap gap-2 mb-4">
+                    {suggestions.map((text, idx) => (
+                        <button
+                            key={idx}
+                            onClick={() => onSelect(text)}
+                            className="px-3 py-1.5 bg-white border border-gray-200 rounded-full text-sm text-gray-700 hover:bg-gray-50 hover:border-indigo-300 transition-colors"
+                        >
+                            {text}
+                        </button>
+                    ))}
+                </div>
+            );
+        }
+
+        // Main App
+        function App() {
+            const [messages, setMessages] = useState([]);
+            const [input, setInput] = useState('');
+            const [loading, setLoading] = useState(false);
+            const [conversationId, setConversationId] = useState(null);
+            const [intent, setIntent] = useState({});
+            const [searchId, setSearchId] = useState(null);
+            const [deals, setDeals] = useState([]);
+            const [showResults, setShowResults] = useState(false);
+            const messagesEndRef = useRef(null);
+
+            const quickSuggestions = [
+                "Hotels in Paris",
+                "Beach vacation in Bali",
+                "Tokyo next month",
+                "Budget hotels",
+                "Luxury resort"
+            ];
+
+            useEffect(() => {
+                // Initial greeting
+                setMessages([{
+                    role: 'assistant',
+                    content: "Hey! 👋 I'm here to help you find the best hotel deals worldwide. Where would you like to go?",
+                    timestamp: new Date().toISOString()
+                }]);
+            }, []);
+
+            useEffect(() => {
+                messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+            }, [messages]);
+
+            const sendMessage = async (text) => {
+                if (!text.trim()) return;
+                
+                const userMessage = {
+                    role: 'user',
+                    content: text,
+                    timestamp: new Date().toISOString()
+                };
+                
+                setMessages(prev => [...prev, userMessage]);
+                setInput('');
+                setLoading(true);
+
+                try {
+                    const response = await fetch(`${API_BASE}/api/chat`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            conversation_id: conversationId,
+                            message: text
+                        })
+                    });
+
+                    const data = await response.json();
+                    
+                    setConversationId(data.conversation_id);
+                    setIntent(data.intent || {});
+                    
+                    const assistantMessage = {
+                        role: 'assistant',
+                        content: data.response,
+                        timestamp: new Date().toISOString()
+                    };
+                    
+                    setMessages(prev => [...prev, assistantMessage]);
+
+                    if (data.search_triggered && data.search_id) {
+                        setSearchId(data.search_id);
+                        setShowResults(true);
+                    }
+
+                } catch (error) {
+                    console.error('Chat error:', error);
+                    setMessages(prev => [...prev, {
+                        role: 'assistant',
+                        content: "Sorry, I'm having trouble connecting. Please try again.",
+                        timestamp: new Date().toISOString()
+                    }]);
+                }
+
+                setLoading(false);
+            };
+
+            const handleKeyPress = (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    sendMessage(input);
+                }
+            };
+
+            const handleSearchComplete = (results) => {
+                setDeals(results);
+            };
+
+            return (
+                <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-white to-purple-50">
+                    {/* Header */}
+                    <header className="bg-white border-b border-gray-100 sticky top-0 z-10">
+                        <div className="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
+                            <div className="flex items-center space-x-2">
+                                <div className="w-10 h-10 bg-gradient-to-r from-indigo-600 to-purple-600 rounded-xl flex items-center justify-center">
+                                    <span className="text-white text-xl">🌍</span>
+                                </div>
+                                <div>
+                                    <h1 className="font-bold text-gray-800">GeoPrice Travel</h1>
+                                    <p className="text-xs text-gray-500">Find the best hotel prices worldwide</p>
+                                </div>
+                            </div>
+                            <button 
+                                onClick={() => {
+                                    setMessages([{
+                                        role: 'assistant',
+                                        content: "Hey! 👋 I'm here to help you find the best hotel deals worldwide. Where would you like to go?",
+                                        timestamp: new Date().toISOString()
+                                    }]);
+                                    setConversationId(null);
+                                    setIntent({});
+                                    setSearchId(null);
+                                    setDeals([]);
+                                    setShowResults(false);
+                                }}
+                                className="text-sm text-indigo-600 hover:text-indigo-800"
+                            >
+                                New Search
+                            </button>
+                        </div>
+                    </header>
+
+                    {/* Main Content */}
+                    <div className="max-w-6xl mx-auto px-4 py-6">
+                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                            {/* Chat Panel */}
+                            <div className="lg:col-span-2">
+                                <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                                    {/* Messages */}
+                                    <div className="h-[500px] overflow-y-auto p-4 bg-gray-50">
+                                        {messages.map((msg, idx) => (
+                                            <ChatMessage key={idx} message={msg} isUser={msg.role === 'user'} />
+                                        ))}
+                                        {loading && <TypingIndicator />}
+                                        <div ref={messagesEndRef} />
+                                    </div>
+
+                                    {/* Quick Replies */}
+                                    {messages.length === 1 && (
+                                        <div className="px-4 pt-2">
+                                            <QuickReplies 
+                                                suggestions={quickSuggestions}
+                                                onSelect={sendMessage}
+                                            />
+                                        </div>
+                                    )}
+
+                                    {/* Input */}
+                                    <div className="p-4 border-t border-gray-100">
+                                        <div className="flex space-x-2">
+                                            <input
+                                                type="text"
+                                                value={input}
+                                                onChange={(e) => setInput(e.target.value)}
+                                                onKeyPress={handleKeyPress}
+                                                placeholder="Type your message..."
+                                                className="flex-1 px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                                disabled={loading}
+                                            />
+                                            <button
+                                                onClick={() => sendMessage(input)}
+                                                disabled={loading || !input.trim()}
+                                                className="px-6 py-3 bg-indigo-600 text-white rounded-xl font-medium hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                                            >
+                                                Send
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Side Panel */}
+                            <div className="space-y-4">
+                                {/* Intent Card */}
+                                <IntentCard intent={intent} />
+                                
+                                {/* Search Progress */}
+                                {searchId && (
+                                    <SearchProgress 
+                                        searchId={searchId} 
+                                        onComplete={handleSearchComplete}
+                                    />
+                                )}
+                                
+                                {/* Results */}
+                                {deals.length > 0 && <ResultsPanel deals={deals} />}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Footer */}
+                    <footer className="text-center py-6 text-gray-500 text-sm">
+                        <p>Prices are checked in real-time from 12 countries to find you the best deals.</p>
+                    </footer>
+                </div>
+            );
+        }
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
