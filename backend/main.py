@@ -355,7 +355,25 @@ async def browse(request: BrowseRequest):
     Returns a session URL pointing to the noVNC web UI through nginx.
     """
     async with browser_port_lock:
-        used_ports = {s["port"] for s in browser_sessions.values()}
+        # Also check ports actually bound by Docker (survives backend restarts)
+        try:
+            ps = subprocess.run(
+                ["docker", "ps", "--format", "{{.Ports}}"],
+                capture_output=True, text=True, timeout=5
+            )
+            docker_ports = set()
+            for line in ps.stdout.splitlines():
+                for segment in line.split(","):
+                    segment = segment.strip()
+                    if "127.0.0.1:" in segment:
+                        try:
+                            docker_ports.add(int(segment.split("127.0.0.1:")[1].split("->")[0]))
+                        except (IndexError, ValueError):
+                            pass
+        except Exception:
+            docker_ports = set()
+
+        used_ports = {s["port"] for s in browser_sessions.values()} | docker_ports
         free_ports = [p for p in BROWSER_PORTS if p not in used_ports]
         if not free_ports:
             raise HTTPException(
@@ -404,6 +422,16 @@ async def browse(request: BrowseRequest):
             "url": request.url,
             "started_at": datetime.utcnow().isoformat(),
         }
+
+    # Wait until noVNC/websockify is actually accepting connections (max 15s)
+    import socket
+    for _ in range(30):
+        await asyncio.sleep(0.5)
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                break
+        except (ConnectionRefusedError, OSError):
+            continue
 
     # Schedule cleanup after 30 minutes (outside the lock)
     asyncio.create_task(_cleanup_browser_session(session_id, container_name, delay=1800))
