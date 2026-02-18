@@ -5,6 +5,7 @@ Chat interface + Price search engine
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import date, datetime
@@ -12,6 +13,7 @@ from uuid import uuid4, UUID
 import asyncio
 import json
 import os
+from pathlib import Path
 
 from chat_service import ChatService
 from price_engine import PriceEngine
@@ -90,10 +92,13 @@ class HotelDeal(BaseModel):
     stars: Optional[int] = None
     location: str
     geo_country: str
+    geo_country_name: Optional[str] = None
     geo_price: float
     geo_currency: str
     usd_price: float
     baseline_usd_price: Optional[float] = None
+    baseline_geo: Optional[str] = None
+    baseline_geo_name: Optional[str] = None
     savings_percent: Optional[float] = None
     savings_usd: Optional[float] = None
     room_type: Optional[str] = None
@@ -101,6 +106,7 @@ class HotelDeal(BaseModel):
     free_cancellation: bool = False
     review_score: Optional[float] = None
     booking_url: str
+    baseline_url: Optional[str] = None
 
 
 class SearchResult(BaseModel):
@@ -119,8 +125,17 @@ class SearchResult(BaseModel):
 
 # ============== Endpoints ==============
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def root():
+    """Serve the frontend"""
+    html_path = Path(__file__).parent.parent / "frontend" / "index.html"
+    if html_path.exists():
+        return HTMLResponse(content=html_path.read_text())
+    return HTMLResponse(content="<h1>GeoPrice API running. Frontend not found.</h1>")
+
+
+@app.get("/api/health")
+async def api_root():
     return {"status": "ok", "service": "GeoPrice Travel API"}
 
 

@@ -12,7 +12,6 @@
     <style>
         body { font-family: 'Inter', sans-serif; }
         .chat-gradient { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-        .glass { background: rgba(255, 255, 255, 0.1); backdrop-filter: blur(10px); }
         .typing-dot { animation: typing 1.4s infinite; }
         .typing-dot:nth-child(2) { animation-delay: 0.2s; }
         .typing-dot:nth-child(3) { animation-delay: 0.4s; }
@@ -28,20 +27,33 @@
     <div id="root"></div>
 
     <script type="text/babel">
-        const { useState, useEffect, useRef, useCallback } = React;
+        const { useState, useEffect, useRef } = React;
 
-        // API Configuration
-        const API_BASE = 'http://localhost:8000';
+        // Use relative URLs — works regardless of which server/IP hosts the app
+        const API_BASE = '';
+        const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const WS_HOST = window.location.host;
+
+        // All 32 supported country flags
+        const COUNTRY_FLAGS = {
+            'BR': '🇧🇷', 'IN': '🇮🇳', 'AR': '🇦🇷', 'TR': '🇹🇷',
+            'ID': '🇮🇩', 'TH': '🇹🇭', 'PL': '🇵🇱', 'MX': '🇲🇽',
+            'ZA': '🇿🇦', 'PT': '🇵🇹', 'US': '🇺🇸', 'GB': '🇬🇧',
+            'VN': '🇻🇳', 'MY': '🇲🇾', 'BD': '🇧🇩', 'PK': '🇵🇰',
+            'BG': '🇧🇬', 'SK': '🇸🇰', 'RS': '🇷🇸', 'HU': '🇭🇺',
+            'KZ': '🇰🇿', 'NG': '🇳🇬', 'MA': '🇲🇦', 'TN': '🇹🇳',
+            'PE': '🇵🇪', 'CL': '🇨🇱', 'JP': '🇯🇵', 'KR': '🇰🇷',
+            'SG': '🇸🇬', 'HK': '🇭🇰', 'FR': '🇫🇷', 'CA': '🇨🇦',
+        };
 
         // ============== Components ==============
 
-        // Chat Message Bubble
         function ChatMessage({ message, isUser }) {
             return (
                 <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-4`}>
                     <div className={`max-w-[80%] rounded-2xl px-4 py-3 ${
-                        isUser 
-                            ? 'bg-indigo-600 text-white rounded-br-md' 
+                        isUser
+                            ? 'bg-indigo-600 text-white rounded-br-md'
                             : 'bg-white text-gray-800 shadow-sm border border-gray-100 rounded-bl-md'
                     }`}>
                         <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.content}</p>
@@ -53,7 +65,6 @@
             );
         }
 
-        // Typing Indicator
         function TypingIndicator() {
             return (
                 <div className="flex justify-start mb-4">
@@ -68,15 +79,9 @@
             );
         }
 
-        // Intent Summary Card
         function IntentCard({ intent }) {
             if (!intent.destination_city) return null;
-            
-            const formatDate = (dateStr) => {
-                if (!dateStr) return '---';
-                return new Date(dateStr).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-            };
-
+            const fmt = (d) => d ? new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '---';
             return (
                 <div className="bg-gradient-to-r from-indigo-500 to-purple-600 rounded-xl p-4 text-white mb-4 shadow-lg">
                     <h3 className="font-semibold mb-2 flex items-center">
@@ -87,424 +92,314 @@
                         Your Trip
                     </h3>
                     <div className="grid grid-cols-2 gap-2 text-sm">
-                        <div>
-                            <span className="text-indigo-200">Destination:</span>
-                            <p className="font-medium">{intent.destination_city || '---'}</p>
-                        </div>
-                        <div>
-                            <span className="text-indigo-200">Hotel Type:</span>
-                            <p className="font-medium capitalize">{intent.hotel_tier || '---'}</p>
-                        </div>
-                        <div>
-                            <span className="text-indigo-200">Check-in:</span>
-                            <p className="font-medium">{formatDate(intent.check_in)}</p>
-                        </div>
-                        <div>
-                            <span className="text-indigo-200">Check-out:</span>
-                            <p className="font-medium">{formatDate(intent.check_out)}</p>
-                        </div>
-                        <div>
-                            <span className="text-indigo-200">Guests:</span>
-                            <p className="font-medium">{intent.guests}</p>
-                        </div>
-                        <div>
-                            <span className="text-indigo-200">Rooms:</span>
-                            <p className="font-medium">{intent.rooms}</p>
-                        </div>
+                        <div><span className="text-indigo-200">Destination:</span><p className="font-medium">{intent.destination_city}</p></div>
+                        <div><span className="text-indigo-200">Hotel Type:</span><p className="font-medium capitalize">{intent.hotel_tier || '---'}</p></div>
+                        <div><span className="text-indigo-200">Check-in:</span><p className="font-medium">{fmt(intent.check_in)}</p></div>
+                        <div><span className="text-indigo-200">Check-out:</span><p className="font-medium">{fmt(intent.check_out)}</p></div>
+                        <div><span className="text-indigo-200">Guests:</span><p className="font-medium">{intent.guests}</p></div>
+                        <div><span className="text-indigo-200">Rooms:</span><p className="font-medium">{intent.rooms}</p></div>
                     </div>
                 </div>
             );
         }
 
-        // Search Progress
         function SearchProgress({ searchId, onComplete }) {
             const [status, setStatus] = useState('connecting');
             const [progress, setProgress] = useState(0);
             const [geosCompleted, setGeosCompleted] = useState([]);
-            const [geosTotal, setGeosTotal] = useState(12);
-            const [bestDeals, setBestDeals] = useState([]);
+            const [geosTotal, setGeosTotal] = useState(32);
+            const [liveDeals, setLiveDeals] = useState(0);
 
             useEffect(() => {
                 if (!searchId) return;
-
-                const ws = new WebSocket(`ws://localhost:8000/api/search/${searchId}/stream`);
-
+                const ws = new WebSocket(`${WS_PROTOCOL}//${WS_HOST}/api/search/${searchId}/stream`);
                 ws.onopen = () => setStatus('searching');
-                
                 ws.onmessage = (event) => {
                     const data = JSON.parse(event.data);
                     setProgress(data.progress || 0);
                     setGeosCompleted(data.geos_completed || []);
-                    setGeosTotal(data.geos_total || 12);
-                    
-                    if (data.best_deals) {
-                        setBestDeals(data.best_deals);
-                    }
-                    
+                    setGeosTotal(data.geos_total || 32);
+                    if (data.best_deals) setLiveDeals(data.best_deals.length);
                     if (data.completed || data.status === 'completed') {
                         setStatus('completed');
                         onComplete(data.best_deals || []);
                         ws.close();
                     }
                 };
-
                 ws.onerror = () => {
-                    setStatus('error');
-                    // Fallback to polling
-                    pollResults(searchId);
+                    setStatus('polling');
+                    const interval = setInterval(async () => {
+                        try {
+                            const res = await fetch(`${API_BASE}/api/search/${searchId}`);
+                            const data = await res.json();
+                            setProgress(data.progress || 0);
+                            setGeosCompleted(data.geos_completed || []);
+                            if (data.status === 'completed') {
+                                clearInterval(interval);
+                                setStatus('completed');
+                                onComplete(data.best_deals || []);
+                            }
+                        } catch (e) { console.error(e); }
+                    }, 2000);
                 };
-
                 return () => ws.close();
             }, [searchId]);
 
-            const pollResults = async (id) => {
-                const interval = setInterval(async () => {
-                    try {
-                        const res = await fetch(`${API_BASE}/api/search/${id}`);
-                        const data = await res.json();
-                        setProgress(data.progress || 0);
-                        setGeosCompleted(data.geos_completed || []);
-                        
-                        if (data.status === 'completed') {
-                            clearInterval(interval);
-                            setStatus('completed');
-                            onComplete(data.best_deals || []);
-                        }
-                    } catch (e) {
-                        console.error('Poll error:', e);
-                    }
-                }, 2000);
-            };
-
-            const countryFlags = {
-                'BR': '🇧🇷', 'IN': '🇮🇳', 'AR': '🇦🇷', 'TR': '🇹🇷',
-                'ID': '🇮🇩', 'TH': '🇹🇭', 'PL': '🇵🇱', 'MX': '🇲🇽',
-                'ZA': '🇿🇦', 'PT': '🇵🇹', 'US': '🇺🇸', 'GB': '🇬🇧'
-            };
-
             return (
                 <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-100 mb-4">
-                    <div className="flex items-center justify-between mb-4">
-                        <h3 className="font-semibold text-gray-800">
-                            {status === 'searching' ? '🔍 Searching worldwide prices...' : 
-                             status === 'completed' ? '✅ Search complete!' : 
-                             status === 'error' ? '⚠️ Checking prices...' : 
-                             '⏳ Connecting...'}
+                    <div className="flex items-center justify-between mb-3">
+                        <h3 className="font-semibold text-gray-800 text-sm">
+                            {status === 'searching' || status === 'polling' ? '🔍 Searching worldwide...' :
+                             status === 'completed' ? '✅ Search complete!' : '⏳ Connecting...'}
                         </h3>
-                        <span className="text-sm text-gray-500">{progress}%</span>
+                        <span className="text-sm font-semibold text-indigo-600">{progress}%</span>
                     </div>
-                    
                     <div className="w-full bg-gray-200 rounded-full h-2 mb-4">
-                        <div 
-                            className="bg-gradient-to-r from-indigo-500 to-purple-600 h-2 rounded-full progress-bar"
-                            style={{ width: `${progress}%` }}
-                        ></div>
+                        <div className="bg-gradient-to-r from-indigo-500 to-purple-600 h-2 rounded-full progress-bar" style={{ width: `${progress}%` }}></div>
                     </div>
-                    
-                    <div className="flex flex-wrap gap-2">
-                        {Object.keys(countryFlags).map(geo => (
-                            <span 
-                                key={geo}
-                                className={`text-lg transition-all ${
-                                    geosCompleted.includes(geo) ? 'opacity-100' : 'opacity-30 grayscale'
-                                }`}
-                                title={geo}
-                            >
-                                {countryFlags[geo]}
+                    <div className="flex flex-wrap gap-1.5">
+                        {Object.keys(COUNTRY_FLAGS).map(geo => (
+                            <span key={geo} className={`text-base transition-all ${geosCompleted.includes(geo) ? 'opacity-100' : 'opacity-20 grayscale'}`} title={geo}>
+                                {COUNTRY_FLAGS[geo]}
                             </span>
                         ))}
                     </div>
-                    
-                    {bestDeals.length > 0 && status !== 'completed' && (
-                        <div className="mt-4 pt-4 border-t border-gray-100">
-                            <p className="text-sm text-gray-600">
-                                🎉 Found {bestDeals.length} deals with savings so far!
-                            </p>
-                        </div>
+                    {liveDeals > 0 && status !== 'completed' && (
+                        <p className="text-xs text-green-600 mt-3 font-medium">🎉 {liveDeals} deals found so far...</p>
                     )}
                 </div>
             );
         }
 
-        // Deal Card
-        function DealCard({ deal }) {
-            const stars = '⭐'.repeat(deal.stars || 0);
-            
+        // Deal Card — shows cheapest-geo button + US comparison button
+        function DealCard({ deal, rank }) {
+            const stars = deal.stars ? '★'.repeat(deal.stars) : '';
+            const flag = COUNTRY_FLAGS[deal.geo_country] || '🌍';
+            const baseFlag = COUNTRY_FLAGS[deal.baseline_geo || 'US'] || '🇺🇸';
+            const savingsPct = deal.savings_percent || 0;
+            const badgeColor = savingsPct >= 20 ? 'bg-green-500' : savingsPct >= 10 ? 'bg-emerald-400' : 'bg-teal-400';
+
             return (
-                <div className="bg-white rounded-xl p-4 shadow-sm border border-gray-100 deal-card transition-all hover:shadow-md">
-                    <div className="flex justify-between items-start mb-2">
+                <div className="bg-white rounded-xl shadow-sm border border-gray-100 deal-card transition-all hover:shadow-md overflow-hidden">
+                    {/* Top row: rank + name + savings badge */}
+                    <div className="flex items-start gap-3 p-4 pb-2">
+                        <div className="flex-shrink-0 w-7 h-7 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-center mt-0.5">
+                            {rank}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                            <h4 className="font-semibold text-gray-800 text-sm leading-tight truncate">{deal.hotel_name}</h4>
+                            <p className="text-xs text-gray-400 mt-0.5 truncate">{deal.location}</p>
+                            {stars && <p className="text-yellow-400 text-xs mt-0.5">{stars}</p>}
+                        </div>
+                        <div className={`flex-shrink-0 ${badgeColor} text-white px-2.5 py-1 rounded-full text-xs font-bold`}>
+                            Save {savingsPct}%
+                        </div>
+                    </div>
+
+                    {/* Price comparison row */}
+                    <div className="px-4 py-3 bg-gray-50 flex items-center gap-4">
+                        {/* Cheapest price */}
                         <div className="flex-1">
-                            <h4 className="font-semibold text-gray-800 leading-tight">{deal.hotel_name}</h4>
-                            <p className="text-xs text-gray-500 mt-1">{deal.location}</p>
-                            {deal.stars && <p className="text-xs mt-1">{stars}</p>}
+                            <p className="text-xs text-gray-400 mb-0.5">Best price {flag} {deal.geo_country_name}</p>
+                            <p className="text-xl font-bold text-gray-900">${deal.usd_price?.toLocaleString()}</p>
+                            <p className="text-xs text-gray-400">{deal.geo_currency} {deal.geo_price?.toLocaleString()}</p>
                         </div>
-                        <div className="bg-green-100 text-green-700 px-2 py-1 rounded-full text-xs font-semibold">
-                            Save {deal.savings_percent}%
+                        {/* Arrow */}
+                        <div className="text-gray-300 text-lg">vs</div>
+                        {/* Baseline price */}
+                        <div className="flex-1 text-right">
+                            <p className="text-xs text-gray-400 mb-0.5">{baseFlag} {deal.baseline_geo_name || 'US'} price</p>
+                            <p className="text-xl font-bold text-gray-400 line-through">${deal.baseline_usd_price?.toLocaleString()}</p>
+                            <p className="text-xs text-green-600 font-medium">Save ${deal.savings_usd?.toLocaleString()}</p>
                         </div>
                     </div>
-                    
-                    <div className="flex items-end justify-between mt-3">
-                        <div>
-                            <p className="text-xs text-gray-500 line-through">${deal.baseline_usd_price}</p>
-                            <p className="text-2xl font-bold text-gray-800">${deal.usd_price}</p>
-                            <p className="text-xs text-gray-500">
-                                via {deal.geo_country_name} ({deal.geo_currency} {deal.geo_price.toLocaleString()})
-                            </p>
+
+                    {/* Badges row */}
+                    {(deal.free_cancellation || deal.includes_breakfast || deal.review_score) && (
+                        <div className="flex gap-2 px-4 py-2 flex-wrap">
+                            {deal.free_cancellation && <span className="text-xs bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full">Free cancellation</span>}
+                            {deal.includes_breakfast && <span className="text-xs bg-orange-50 text-orange-700 px-2 py-0.5 rounded-full">Breakfast included</span>}
+                            {deal.review_score && <span className="text-xs bg-yellow-50 text-yellow-700 px-2 py-0.5 rounded-full">⭐ {deal.review_score}</span>}
                         </div>
-                        <a 
-                            href={deal.booking_url} 
-                            target="_blank" 
+                    )}
+
+                    {/* Two booking buttons */}
+                    <div className="flex gap-2 px-4 pb-4 pt-2">
+                        <a
+                            href={deal.booking_url}
+                            target="_blank"
                             rel="noopener noreferrer"
-                            className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+                            className="flex-1 text-center bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-2 rounded-lg text-xs font-semibold transition-colors"
                         >
-                            Book Now
+                            {flag} Book Cheapest ({deal.geo_country})
                         </a>
-                    </div>
-                    
-                    <div className="flex gap-2 mt-3">
-                        {deal.free_cancellation && (
-                            <span className="text-xs bg-blue-50 text-blue-700 px-2 py-1 rounded">Free cancellation</span>
-                        )}
-                        {deal.includes_breakfast && (
-                            <span className="text-xs bg-orange-50 text-orange-700 px-2 py-1 rounded">Breakfast included</span>
-                        )}
-                        {deal.review_score && (
-                            <span className="text-xs bg-yellow-50 text-yellow-700 px-2 py-1 rounded">
-                                {deal.review_score} rating
-                            </span>
+                        {deal.baseline_url ? (
+                            <a
+                                href={deal.baseline_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="flex-1 text-center bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 rounded-lg text-xs font-semibold transition-colors"
+                            >
+                                {baseFlag} Compare {deal.baseline_geo || 'US'} Price
+                            </a>
+                        ) : (
+                            <a
+                                href={`https://www.booking.com/search.html?ss=${encodeURIComponent(deal.hotel_name)}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="flex-1 text-center bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 rounded-lg text-xs font-semibold transition-colors"
+                            >
+                                🇺🇸 Search on Booking.com
+                            </a>
                         )}
                     </div>
                 </div>
             );
         }
 
-        // Results Panel
         function ResultsPanel({ deals }) {
             if (!deals || deals.length === 0) {
-                return (
-                    <div className="text-center py-8 text-gray-500">
-                        <p>No deals found yet. Start a search to see results!</p>
-                    </div>
-                );
+                return <div className="text-center py-8 text-gray-400 text-sm">No deals yet — start a search!</div>;
             }
-
-            const totalSavings = deals.reduce((sum, d) => sum + d.savings_usd, 0);
-            const avgSavings = deals.reduce((sum, d) => sum + d.savings_percent, 0) / deals.length;
-
+            const best = deals[0];
+            const avgSavings = (deals.reduce((s, d) => s + (d.savings_percent || 0), 0) / deals.length).toFixed(1);
             return (
                 <div>
                     <div className="bg-gradient-to-r from-green-500 to-emerald-600 rounded-xl p-4 text-white mb-4">
-                        <h3 className="font-semibold mb-2">💰 Savings Summary</h3>
-                        <div className="grid grid-cols-2 gap-4 text-sm">
+                        <h3 className="font-semibold mb-2 text-sm">💰 Savings Summary</h3>
+                        <div className="grid grid-cols-3 gap-2 text-center">
                             <div>
-                                <p className="text-green-100">Best Deals Found</p>
+                                <p className="text-green-100 text-xs">Deals Found</p>
                                 <p className="text-2xl font-bold">{deals.length}</p>
                             </div>
                             <div>
-                                <p className="text-green-100">Avg. Savings</p>
-                                <p className="text-2xl font-bold">{avgSavings.toFixed(1)}%</p>
+                                <p className="text-green-100 text-xs">Best Save</p>
+                                <p className="text-2xl font-bold">{best.savings_percent}%</p>
+                            </div>
+                            <div>
+                                <p className="text-green-100 text-xs">Avg Save</p>
+                                <p className="text-2xl font-bold">{avgSavings}%</p>
                             </div>
                         </div>
                     </div>
-                    
-                    <div className="space-y-3 max-h-[500px] overflow-y-auto pr-2">
+                    <div className="space-y-3 max-h-[600px] overflow-y-auto pr-1">
                         {deals.map((deal, idx) => (
-                            <DealCard key={deal.hotel_id || idx} deal={deal} />
+                            <DealCard key={deal.hotel_id || idx} deal={deal} rank={idx + 1} />
                         ))}
                     </div>
                 </div>
             );
         }
 
-        // Quick Replies
-        function QuickReplies({ onSelect, suggestions }) {
+        function QuickReplies({ onSelect }) {
+            const suggestions = ["Hotels in Paris", "Beach resort in Bali", "Tokyo next month", "Budget hotels NYC", "Luxury resort Maldives"];
             return (
-                <div className="flex flex-wrap gap-2 mb-4">
-                    {suggestions.map((text, idx) => (
-                        <button
-                            key={idx}
-                            onClick={() => onSelect(text)}
-                            className="px-3 py-1.5 bg-white border border-gray-200 rounded-full text-sm text-gray-700 hover:bg-gray-50 hover:border-indigo-300 transition-colors"
-                        >
-                            {text}
+                <div className="flex flex-wrap gap-2 mb-3">
+                    {suggestions.map((t, i) => (
+                        <button key={i} onClick={() => onSelect(t)}
+                            className="px-3 py-1.5 bg-white border border-gray-200 rounded-full text-xs text-gray-600 hover:bg-gray-50 hover:border-indigo-300 transition-colors">
+                            {t}
                         </button>
                     ))}
                 </div>
             );
         }
 
-        // Main App
         function App() {
-            const [messages, setMessages] = useState([]);
+            const [messages, setMessages] = useState([{
+                role: 'assistant',
+                content: "Hey! 👋 I'm GeoPrice — I check hotel prices across 32 countries simultaneously to find you the biggest savings. Where would you like to go?",
+                timestamp: new Date().toISOString()
+            }]);
             const [input, setInput] = useState('');
             const [loading, setLoading] = useState(false);
             const [conversationId, setConversationId] = useState(null);
             const [intent, setIntent] = useState({});
             const [searchId, setSearchId] = useState(null);
             const [deals, setDeals] = useState([]);
-            const [showResults, setShowResults] = useState(false);
             const messagesEndRef = useRef(null);
 
-            const quickSuggestions = [
-                "Hotels in Paris",
-                "Beach vacation in Bali",
-                "Tokyo next month",
-                "Budget hotels",
-                "Luxury resort"
-            ];
-
-            useEffect(() => {
-                // Initial greeting
-                setMessages([{
-                    role: 'assistant',
-                    content: "Hey! 👋 I'm here to help you find the best hotel deals worldwide. Where would you like to go?",
-                    timestamp: new Date().toISOString()
-                }]);
-            }, []);
-
-            useEffect(() => {
-                messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-            }, [messages]);
+            useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
             const sendMessage = async (text) => {
                 if (!text.trim()) return;
-                
-                const userMessage = {
-                    role: 'user',
-                    content: text,
-                    timestamp: new Date().toISOString()
-                };
-                
-                setMessages(prev => [...prev, userMessage]);
+                const userMsg = { role: 'user', content: text, timestamp: new Date().toISOString() };
+                setMessages(prev => [...prev, userMsg]);
                 setInput('');
                 setLoading(true);
-
                 try {
-                    const response = await fetch(`${API_BASE}/api/chat`, {
+                    const res = await fetch(`${API_BASE}/api/chat`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            conversation_id: conversationId,
-                            message: text
-                        })
+                        body: JSON.stringify({ conversation_id: conversationId, message: text })
                     });
-
-                    const data = await response.json();
-                    
+                    const data = await res.json();
                     setConversationId(data.conversation_id);
                     setIntent(data.intent || {});
-                    
-                    const assistantMessage = {
-                        role: 'assistant',
-                        content: data.response,
-                        timestamp: new Date().toISOString()
-                    };
-                    
-                    setMessages(prev => [...prev, assistantMessage]);
-
+                    setMessages(prev => [...prev, { role: 'assistant', content: data.response, timestamp: new Date().toISOString() }]);
                     if (data.search_triggered && data.search_id) {
                         setSearchId(data.search_id);
-                        setShowResults(true);
+                        setDeals([]);
                     }
-
-                } catch (error) {
-                    console.error('Chat error:', error);
-                    setMessages(prev => [...prev, {
-                        role: 'assistant',
-                        content: "Sorry, I'm having trouble connecting. Please try again.",
-                        timestamp: new Date().toISOString()
-                    }]);
+                } catch (e) {
+                    setMessages(prev => [...prev, { role: 'assistant', content: "Sorry, connection error. Please try again.", timestamp: new Date().toISOString() }]);
                 }
-
                 setLoading(false);
             };
 
-            const handleKeyPress = (e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    sendMessage(input);
-                }
-            };
-
-            const handleSearchComplete = (results) => {
-                setDeals(results);
+            const newSearch = () => {
+                setMessages([{ role: 'assistant', content: "Hey! 👋 Where would you like to go next?", timestamp: new Date().toISOString() }]);
+                setConversationId(null); setIntent({}); setSearchId(null); setDeals([]);
             };
 
             return (
                 <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-white to-purple-50">
-                    {/* Header */}
                     <header className="bg-white border-b border-gray-100 sticky top-0 z-10">
-                        <div className="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
+                        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
                             <div className="flex items-center space-x-2">
-                                <div className="w-10 h-10 bg-gradient-to-r from-indigo-600 to-purple-600 rounded-xl flex items-center justify-center">
-                                    <span className="text-white text-xl">🌍</span>
+                                <div className="w-9 h-9 bg-gradient-to-r from-indigo-600 to-purple-600 rounded-xl flex items-center justify-center">
+                                    <span className="text-white text-lg">🌍</span>
                                 </div>
                                 <div>
-                                    <h1 className="font-bold text-gray-800">GeoPrice Travel</h1>
-                                    <p className="text-xs text-gray-500">Find the best hotel prices worldwide</p>
+                                    <h1 className="font-bold text-gray-800 text-sm">GeoPrice Travel</h1>
+                                    <p className="text-xs text-gray-400">Best hotel prices across 32 countries</p>
                                 </div>
                             </div>
-                            <button 
-                                onClick={() => {
-                                    setMessages([{
-                                        role: 'assistant',
-                                        content: "Hey! 👋 I'm here to help you find the best hotel deals worldwide. Where would you like to go?",
-                                        timestamp: new Date().toISOString()
-                                    }]);
-                                    setConversationId(null);
-                                    setIntent({});
-                                    setSearchId(null);
-                                    setDeals([]);
-                                    setShowResults(false);
-                                }}
-                                className="text-sm text-indigo-600 hover:text-indigo-800"
-                            >
-                                New Search
+                            <button onClick={newSearch} className="text-xs text-indigo-600 hover:text-indigo-800 font-medium border border-indigo-200 px-3 py-1.5 rounded-lg hover:bg-indigo-50 transition-colors">
+                                + New Search
                             </button>
                         </div>
                     </header>
 
-                    {/* Main Content */}
                     <div className="max-w-6xl mx-auto px-4 py-6">
-                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                            {/* Chat Panel */}
+                        <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
+                            {/* Chat panel — 2 cols */}
                             <div className="lg:col-span-2">
-                                <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
-                                    {/* Messages */}
-                                    <div className="h-[500px] overflow-y-auto p-4 bg-gray-50">
-                                        {messages.map((msg, idx) => (
-                                            <ChatMessage key={idx} message={msg} isUser={msg.role === 'user'} />
-                                        ))}
+                                <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden flex flex-col" style={{ height: '80vh' }}>
+                                    <div className="flex-1 overflow-y-auto p-4 bg-gray-50">
+                                        {messages.map((msg, i) => <ChatMessage key={i} message={msg} isUser={msg.role === 'user'} />)}
                                         {loading && <TypingIndicator />}
                                         <div ref={messagesEndRef} />
                                     </div>
-
-                                    {/* Quick Replies */}
                                     {messages.length === 1 && (
-                                        <div className="px-4 pt-2">
-                                            <QuickReplies 
-                                                suggestions={quickSuggestions}
-                                                onSelect={sendMessage}
-                                            />
+                                        <div className="px-4 pt-2 bg-gray-50 border-t border-gray-100">
+                                            <QuickReplies onSelect={sendMessage} />
                                         </div>
                                     )}
-
-                                    {/* Input */}
-                                    <div className="p-4 border-t border-gray-100">
-                                        <div className="flex space-x-2">
+                                    <div className="p-3 border-t border-gray-100 bg-white">
+                                        <div className="flex gap-2">
                                             <input
-                                                type="text"
                                                 value={input}
-                                                onChange={(e) => setInput(e.target.value)}
-                                                onKeyPress={handleKeyPress}
-                                                placeholder="Type your message..."
-                                                className="flex-1 px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                                                onChange={e => setInput(e.target.value)}
+                                                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(input); } }}
+                                                placeholder="Where would you like to go?"
+                                                className="flex-1 px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
                                                 disabled={loading}
                                             />
                                             <button
                                                 onClick={() => sendMessage(input)}
                                                 disabled={loading || !input.trim()}
-                                                className="px-6 py-3 bg-indigo-600 text-white rounded-xl font-medium hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                                                className="px-4 py-2.5 bg-indigo-600 text-white rounded-xl text-sm font-medium hover:bg-indigo-700 disabled:opacity-40 transition-colors"
                                             >
                                                 Send
                                             </button>
@@ -513,29 +408,38 @@
                                 </div>
                             </div>
 
-                            {/* Side Panel */}
-                            <div className="space-y-4">
-                                {/* Intent Card */}
+                            {/* Results panel — 3 cols */}
+                            <div className="lg:col-span-3 space-y-4 overflow-y-auto" style={{ maxHeight: '80vh' }}>
                                 <IntentCard intent={intent} />
-                                
-                                {/* Search Progress */}
-                                {searchId && (
-                                    <SearchProgress 
-                                        searchId={searchId} 
-                                        onComplete={handleSearchComplete}
-                                    />
-                                )}
-                                
-                                {/* Results */}
+                                {searchId && <SearchProgress searchId={searchId} onComplete={setDeals} />}
                                 {deals.length > 0 && <ResultsPanel deals={deals} />}
+                                {!searchId && deals.length === 0 && (
+                                    <div className="bg-white rounded-2xl p-8 text-center border border-gray-100 shadow-sm">
+                                        <div className="text-4xl mb-3">🔍</div>
+                                        <h3 className="font-semibold text-gray-700 mb-2">How it works</h3>
+                                        <p className="text-sm text-gray-500 mb-4">Tell me your destination and travel dates. I'll check Booking.com prices from 32 countries and show you where the same hotel is cheapest.</p>
+                                        <div className="grid grid-cols-3 gap-3 text-xs text-gray-500">
+                                            <div className="bg-indigo-50 rounded-lg p-3">
+                                                <div className="text-2xl mb-1">💬</div>
+                                                <p className="font-medium text-gray-700">Chat</p>
+                                                <p>Tell me where & when</p>
+                                            </div>
+                                            <div className="bg-purple-50 rounded-lg p-3">
+                                                <div className="text-2xl mb-1">🌍</div>
+                                                <p className="font-medium text-gray-700">Search</p>
+                                                <p>32 countries checked</p>
+                                            </div>
+                                            <div className="bg-green-50 rounded-lg p-3">
+                                                <div className="text-2xl mb-1">💰</div>
+                                                <p className="font-medium text-gray-700">Save</p>
+                                                <p>Up to 40% cheaper</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                         </div>
                     </div>
-
-                    {/* Footer */}
-                    <footer className="text-center py-6 text-gray-500 text-sm">
-                        <p>Prices are checked in real-time from 12 countries to find you the best deals.</p>
-                    </footer>
                 </div>
             );
         }

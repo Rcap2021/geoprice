@@ -590,11 +590,14 @@ class PriceEngine:
                     "geo_currency": cheapest["geo_currency"],
                     "usd_price": cheapest["usd_price"],
                     "baseline_usd_price": baseline_price,
+                    "baseline_geo": baseline_geo,
+                    "baseline_geo_name": self.GEO_COUNTRIES.get(baseline_geo, {}).get("name", baseline_geo),
                     "savings_percent": round(savings_percent, 1),
                     "savings_usd": round(savings_usd, 2),
                     "includes_breakfast": cheapest.get("includes_breakfast", False),
                     "free_cancellation": cheapest.get("free_cancellation", False),
                     "booking_url": cheapest["booking_url"],
+                    "baseline_url": baseline.get("booking_url", ""),
                 })
         
         # Sort by savings percentage
