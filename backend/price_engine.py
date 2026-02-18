@@ -313,11 +313,24 @@ class PriceEngine:
                     
                     // Price - try multiple selectors
                     let price = '';
-                    const priceEl = card.querySelector('[data-testid="price-and-discounted-price"]') 
+                    let taxText = '';
+                    const priceEl = card.querySelector('[data-testid="price-and-discounted-price"]')
                         || card.querySelector('.bui-price-display__value')
                         || card.querySelector('[class*="price"]');
                     if (priceEl) {
                         price = priceEl.innerText.trim();
+                        // Walk up to find a container that also holds taxes/fees text.
+                        // Booking.com often shows "+$45 taxes and fees" as a sibling/cousin of the price.
+                        let container = priceEl.parentElement;
+                        for (let i = 0; i < 6 && container; i++) {
+                            const text = container.innerText || '';
+                            const taxMatch = text.match(/\+\s*[^\d]*[\d.,]+[^\d]*(?:tax|fee|charge)/i);
+                            if (taxMatch) {
+                                taxText = taxMatch[0];
+                                break;
+                            }
+                            container = container.parentElement;
+                        }
                     }
                     
                     // Stars
@@ -359,6 +372,7 @@ class PriceEngine:
                     return {
                         name,
                         price,
+                        taxText,
                         stars,
                         reviewScore,
                         location,
@@ -378,6 +392,11 @@ class PriceEngine:
             # Parse and normalize results
             for hotel in hotels:
                 price_value = self._parse_price(hotel["price"], geo_info["currency"]) * nights
+                # Add taxes/fees if shown separately (common on US locale)
+                tax_value = self._parse_price(hotel.get("taxText", ""), geo_info["currency"])
+                if tax_value > 0:
+                    price_value += tax_value * nights
+                    print(f"[{geo_code}] Tax added for {hotel['name']}: +{tax_value} {geo_info['currency']}")
                 if price_value > 0:
                     results.append({
                         "hotel_name": hotel["name"],
