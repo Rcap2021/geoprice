@@ -273,7 +273,7 @@ async def stream_search_results(websocket: WebSocket, search_id: str):
                     "progress": current_progress,
                     "geos_completed": search.get("geos_completed", []),
                     "geos_total": search.get("geos_total", 0),
-                    "best_deals": search.get("best_deals", [])[:5],  # Top 5
+                    "best_deals": search.get("best_deals", []),
                     "latest_geo": search.get("geos_completed", [])[-1] if search.get("geos_completed") else None
                 })
                 last_progress = current_progress
