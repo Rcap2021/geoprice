@@ -173,11 +173,34 @@
 
         // Deal Card — shows cheapest-geo button + US comparison button
         function DealCard({ deal, rank }) {
+            const [browseLoading, setBrowseLoading] = React.useState(false);
             const stars = deal.stars ? '★'.repeat(deal.stars) : '';
             const flag = COUNTRY_FLAGS[deal.geo_country] || '🌍';
             const baseFlag = COUNTRY_FLAGS[deal.baseline_geo || 'US'] || '🇺🇸';
             const savingsPct = deal.savings_percent || 0;
             const badgeColor = savingsPct >= 20 ? 'bg-green-500' : savingsPct >= 10 ? 'bg-emerald-400' : 'bg-teal-400';
+
+            const handleBookCheapest = async () => {
+                setBrowseLoading(true);
+                try {
+                    const res = await fetch(`${API_BASE}/api/browse`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ url: deal.booking_url, country: deal.geo_country })
+                    });
+                    if (!res.ok) {
+                        const err = await res.json();
+                        alert(`Could not open browser: ${err.detail || 'Unknown error'}`);
+                        return;
+                    }
+                    const data = await res.json();
+                    window.open(data.session_url, '_blank');
+                } catch (e) {
+                    alert('Connection error. Please try again.');
+                } finally {
+                    setBrowseLoading(false);
+                }
+            };
 
             return (
                 <div className="bg-white rounded-xl shadow-sm border border-gray-100 deal-card transition-all hover:shadow-md overflow-hidden">
@@ -225,14 +248,16 @@
 
                     {/* Two booking buttons */}
                     <div className="flex gap-2 px-4 pb-4 pt-2">
-                        <a
-                            href={deal.booking_url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="flex-1 text-center bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-2 rounded-lg text-xs font-semibold transition-colors"
+                        <button
+                            onClick={handleBookCheapest}
+                            disabled={browseLoading}
+                            className="flex-1 text-center bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white px-3 py-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
                         >
-                            {flag} Book Cheapest ({deal.geo_country})
-                        </a>
+                            {browseLoading
+                                ? `Opening ${deal.geo_country_name || deal.geo_country} browser...`
+                                : `${flag} Book Cheapest (${deal.geo_country})`
+                            }
+                        </button>
                         {deal.baseline_url ? (
                             <a
                                 href={deal.baseline_url}
@@ -249,7 +274,7 @@
                                 rel="noopener noreferrer"
                                 className="flex-1 text-center bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 rounded-lg text-xs font-semibold transition-colors"
                             >
-                                🇺🇸 Search on Booking.com
+                                Search on Booking.com
                             </a>
                         )}
                     </div>
@@ -317,9 +342,20 @@
             const [intent, setIntent] = useState({});
             const [searchId, setSearchId] = useState(null);
             const [deals, setDeals] = useState([]);
+            const [userCountry, setUserCountry] = useState('US');
             const messagesEndRef = useRef(null);
 
             useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+
+            // Auto-detect user's country from IP for baseline comparison
+            useEffect(() => {
+                fetch('https://ipapi.co/json/')
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.country_code) setUserCountry(data.country_code);
+                    })
+                    .catch(() => { /* silent fail — keep default US */ });
+            }, []);
 
             const sendMessage = async (text) => {
                 if (!text.trim()) return;
@@ -331,7 +367,7 @@
                     const res = await fetch(`${API_BASE}/api/chat`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ conversation_id: conversationId, message: text })
+                        body: JSON.stringify({ conversation_id: conversationId, message: text, baseline_geo: userCountry })
                     });
                     const data = await res.json();
                     setConversationId(data.conversation_id);

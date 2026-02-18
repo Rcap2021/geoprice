@@ -13,6 +13,8 @@ from uuid import uuid4, UUID
 import asyncio
 import json
 import os
+import secrets
+import subprocess
 from pathlib import Path
 
 from chat_service import ChatService, TravelIntent as ChatTravelIntent
@@ -32,6 +34,11 @@ app.add_middleware(
 # In-memory storage (replace with PostgreSQL in production)
 conversations: Dict[str, dict] = {}
 searches: Dict[str, dict] = {}
+
+# Browser session pool — ports 16080-16099 (20 concurrent sessions)
+BROWSER_PORTS = list(range(16080, 16100))
+browser_sessions: Dict[str, dict] = {}
+browser_port_lock = asyncio.Lock()
 
 # Services
 chat_service = ChatService()
@@ -60,6 +67,17 @@ class Conversation(BaseModel):
 class ChatRequest(BaseModel):
     conversation_id: Optional[str] = None
     message: str
+    baseline_geo: str = "US"
+
+
+class SearchTriggerRequest(BaseModel):
+    intent: TravelIntent
+    baseline_geo: str = "US"
+
+
+class BrowseRequest(BaseModel):
+    url: str
+    country: str  # e.g. "MY", "IN", "BR"
 
 
 class ChatResponse(BaseModel):
@@ -129,36 +147,38 @@ async def chat(request: ChatRequest):
     """
     Main chat endpoint. Handles conversation and intent extraction.
     """
+    baseline_geo = request.baseline_geo
+
     # Get or create conversation
     if request.conversation_id and request.conversation_id in conversations:
         conv_data = conversations[request.conversation_id]
         conv = Conversation(**conv_data)
     else:
         conv = Conversation(id=str(uuid4()))
-    
+
     # Add user message
     conv.messages.append(ChatMessage(role="user", content=request.message))
-    
+
     # Process with LLM
     response_text, updated_intent, search_triggered = await chat_service.process_message(
         messages=conv.messages,
         current_intent=conv.intent,
         user_message=request.message
     )
-    
+
     # Update conversation
     conv.intent = updated_intent
     conv.messages.append(ChatMessage(role="assistant", content=response_text))
-    
+
     # Save conversation
     conversations[conv.id] = conv.model_dump(mode='json')
-    
+
     # If search triggered, start the price search
     search_id = None
     if search_triggered and conv.intent.is_complete():
         conv.status = "searching"
         search_id = str(uuid4())
-        
+
         # Initialize search record
         searches[search_id] = SearchResult(
             search_id=search_id,
@@ -167,10 +187,11 @@ async def chat(request: ChatRequest):
             geos_total=len(price_engine.GEO_COUNTRIES),
             started_at=datetime.utcnow()
         ).model_dump(mode='json')
-        
+        searches[search_id]["baseline_geo"] = baseline_geo
+
         # Start search in background
-        asyncio.create_task(run_price_search(search_id, conv.intent))
-    
+        asyncio.create_task(run_price_search(search_id, conv.intent, baseline_geo))
+
     return ChatResponse(
         conversation_id=conv.id,
         response=response_text,
@@ -190,11 +211,14 @@ async def get_conversation(conversation_id: str):
 
 
 @app.post("/api/search/trigger")
-async def trigger_search(intent: TravelIntent):
+async def trigger_search(request: SearchTriggerRequest):
     """Manually trigger a search with complete intent"""
+    intent = request.intent
+    baseline_geo = request.baseline_geo
+
     if not intent.is_complete():
         raise HTTPException(status_code=400, detail="Intent is incomplete")
-    
+
     search_id = str(uuid4())
     searches[search_id] = SearchResult(
         search_id=search_id,
@@ -203,9 +227,10 @@ async def trigger_search(intent: TravelIntent):
         geos_total=len(price_engine.GEO_COUNTRIES),
         started_at=datetime.utcnow()
     ).model_dump(mode='json')
-    
-    asyncio.create_task(run_price_search(search_id, intent))
-    
+    searches[search_id]["baseline_geo"] = baseline_geo
+
+    asyncio.create_task(run_price_search(search_id, intent, baseline_geo))
+
     return {"search_id": search_id, "status": "pending"}
 
 
@@ -270,34 +295,135 @@ async def stream_search_results(websocket: WebSocket, search_id: str):
         pass
 
 
-async def run_price_search(search_id: str, intent: TravelIntent):
+async def run_price_search(search_id: str, intent: TravelIntent, baseline_geo: str = "US"):
     """
     Background task to run price search across all geos
     """
     try:
         searches[search_id]["status"] = "in_progress"
-        
+
         # Run the search
         async for update in price_engine.search_all_geos(intent):
             # Update search record with progress
             searches[search_id]["progress"] = update["progress"]
             searches[search_id]["geos_completed"] = update["geos_completed"]
-            
+
             if "geo_results" in update:
                 geo = update["geo"]
                 searches[search_id]["all_results"][geo] = update["geo_results"]
-                
-                # Recalculate best deals
+
+                # Recalculate best deals vs user's baseline country
                 searches[search_id]["best_deals"] = price_engine.calculate_best_deals(
-                    searches[search_id]["all_results"]
+                    searches[search_id]["all_results"],
+                    baseline_geo=baseline_geo
                 )
-        
+
         searches[search_id]["status"] = "completed"
         searches[search_id]["completed_at"] = datetime.utcnow().isoformat()
-        
+
     except Exception as e:
         searches[search_id]["status"] = "failed"
         searches[search_id]["error"] = str(e)
+
+
+def _build_proxy_url_for_geo(geo_code: str) -> str:
+    """Build a full proxy URL for a given country code."""
+    proxy_format = os.getenv("PROXY_FORMAT", "viprox")
+    proxy_base_url = os.getenv("PROXY_BASE_URL", "")
+    proxy_username = os.getenv("PROXY_USERNAME", "")
+    proxy_password = os.getenv("PROXY_PASSWORD", "")
+
+    if not proxy_base_url:
+        return ""
+
+    geo_lower = geo_code.lower()
+
+    if proxy_format == "viprox":
+        # e.g. http://chatleg-rc_my:password@gw-magic.viprox.net:7383
+        host_part = proxy_base_url.replace("http://", "").replace("https://", "")
+        scheme = "https" if proxy_base_url.startswith("https://") else "http"
+        geo_username = f"{proxy_username}-rc_{geo_lower}"
+        return f"{scheme}://{geo_username}:{proxy_password}@{host_part}"
+
+    return proxy_base_url
+
+
+@app.post("/api/browse")
+async def browse(request: BrowseRequest):
+    """
+    Spawn a geo-targeted remote browser (Docker + noVNC) for a given URL and country.
+    Returns a session URL pointing to the noVNC web UI through nginx.
+    """
+    async with browser_port_lock:
+        used_ports = {s["port"] for s in browser_sessions.values()}
+        free_ports = [p for p in BROWSER_PORTS if p not in used_ports]
+        if not free_ports:
+            raise HTTPException(
+                status_code=503,
+                detail="All browser sessions are in use. Please try again in a few minutes."
+            )
+        port = free_ports[0]
+        slot_index = BROWSER_PORTS.index(port)
+
+        session_id = secrets.token_hex(8)
+        container_name = f"browse_{session_id}"
+
+        proxy_url = _build_proxy_url_for_geo(request.country)
+
+        docker_cmd = [
+            "docker", "run", "-d", "--rm",
+            "--name", container_name,
+            "-p", f"127.0.0.1:{port}:6080",
+            "-e", f"PROXY_URL={proxy_url}",
+            "-e", f"START_URL={request.url}",
+            "--memory=512m",
+            "--cpus=0.5",
+            "geoprice-browser"
+        ]
+
+        try:
+            result = subprocess.run(
+                docker_cmd,
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            if result.returncode != 0:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to start browser: {result.stderr.strip()}"
+                )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=500, detail="Docker launch timed out")
+
+        browser_sessions[session_id] = {
+            "port": port,
+            "slot": slot_index,
+            "container_name": container_name,
+            "country": request.country,
+            "url": request.url,
+            "started_at": datetime.utcnow().isoformat(),
+        }
+
+    # Schedule cleanup after 30 minutes (outside the lock)
+    asyncio.create_task(_cleanup_browser_session(session_id, container_name, delay=1800))
+
+    session_url = f"/browse/s{slot_index}/vnc.html?autoconnect=true&resize=scale"
+    return {
+        "session_url": session_url,
+        "session_id": session_id,
+        "expires_in": 1800
+    }
+
+
+async def _cleanup_browser_session(session_id: str, container_name: str, delay: int = 1800):
+    """Stop a browser container and release its port slot after `delay` seconds."""
+    await asyncio.sleep(delay)
+    try:
+        subprocess.run(["docker", "stop", container_name], timeout=10, capture_output=True)
+    except Exception:
+        pass
+    browser_sessions.pop(session_id, None)
 
 
 # ============== Health Check ==============
