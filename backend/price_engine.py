@@ -592,8 +592,10 @@ class PriceEngine:
             cheapest_geo = min(prices.keys(), key=lambda g: prices[g]["usd_price"])
             cheapest = prices[cheapest_geo]
             
-            # Get baseline price (US or first available)
-            baseline = prices.get(baseline_geo, prices.get(list(prices.keys())[0]))
+            # Get baseline price — fall back to US, then first available
+            # (baseline_geo may be an unsupported country not in scraped results)
+            effective_baseline_geo = baseline_geo if baseline_geo in prices else ("US" if "US" in prices else list(prices.keys())[0])
+            baseline = prices[effective_baseline_geo]
             baseline_price = baseline["usd_price"]
             
             # Calculate savings
@@ -614,8 +616,8 @@ class PriceEngine:
                     "geo_currency": cheapest["geo_currency"],
                     "usd_price": cheapest["usd_price"],
                     "baseline_usd_price": baseline_price,
-                    "baseline_geo": baseline_geo,
-                    "baseline_geo_name": self.GEO_COUNTRIES.get(baseline_geo, {}).get("name", baseline_geo),
+                    "baseline_geo": effective_baseline_geo,
+                    "baseline_geo_name": self.GEO_COUNTRIES.get(effective_baseline_geo, {}).get("name", effective_baseline_geo),
                     "savings_percent": round(savings_percent, 1),
                     "savings_usd": round(savings_usd, 2),
                     "includes_breakfast": cheapest.get("includes_breakfast", False),

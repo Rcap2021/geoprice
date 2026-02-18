@@ -371,11 +371,14 @@
             useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
             // Auto-detect user's country from IP for baseline comparison
+            // Only use the detected country if it's one of our 32 supported geos; otherwise keep US
             useEffect(() => {
                 fetch('https://ipapi.co/json/')
                     .then(r => r.json())
                     .then(data => {
-                        if (data.country_code) setUserCountry(data.country_code);
+                        if (data.country_code && COUNTRY_FLAGS[data.country_code]) {
+                            setUserCountry(data.country_code);
+                        }
                     })
                     .catch(() => { /* silent fail — keep default US */ });
             }, []);
