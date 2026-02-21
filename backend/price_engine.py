@@ -763,20 +763,23 @@ class PriceEngine:
                 await browser.close()
     
     @staticmethod
-    def _is_specific_block(block_id: str) -> bool:
-        """Return True if block_id represents a specific, matched room type.
+    def _room_id_from_block(block_id: str) -> str:
+        """Extract the room-type ID (second segment) from an all_sr_blocks value.
 
-        Booking.com uses all_sr_blocks=HOTEL_ROOM_OCC_MEAL_BOARD in URLs.
-        When the hotel appears but no specific room was matched, the block
-        becomes 0_0_OCC_0_0 (hotel and room IDs are zero).  We must reject
-        these generic placeholders — they can represent any room in the hotel,
-        so comparing them against a specific block from another geo is invalid.
+        Booking.com block format: HOTEL_ROOM_OCC_MEAL_BOARD
+        The HOTEL segment (first) varies by session/geo even for the same property,
+        so we match only on the ROOM segment (second).  A value of '0' means no
+        specific room was matched — treated as unknown and excluded from comparisons.
+
+        Returns the room ID string, or '' if the block is generic/absent.
         """
         if not block_id:
-            return False
+            return ""
         parts = block_id.split("_")
-        # First two segments must be non-zero: hotel_id and room_block_id
-        return len(parts) >= 2 and parts[0] != "0" and parts[1] != "0"
+        if len(parts) < 2:
+            return ""
+        room_id = parts[1]
+        return room_id if room_id != "0" else ""
 
     def calculate_best_deals(
         self,
@@ -849,15 +852,13 @@ class PriceEngine:
                     if p_exp <= p_cheap:
                         continue
 
-                    # Room block matching: both must have the same SPECIFIC block ID.
-                    # Generic blocks (0_0_OCC_0_0) are placeholders — reject them.
-                    block_cheap = valid_prices[g_cheap].get("room_type") or ""
-                    block_exp   = valid_prices[g_exp].get("room_type") or ""
-                    if not (
-                        self._is_specific_block(block_cheap)
-                        and self._is_specific_block(block_exp)
-                        and block_cheap == block_exp
-                    ):
+                    # Room block matching: both must share the same specific room ID
+                    # (second segment of all_sr_blocks).  The first segment (hotel_id)
+                    # varies by session and geo, so we ignore it.  Room ID '0' means
+                    # generic/unmatched — excluded to avoid cross-room-type comparisons.
+                    room_cheap = self._room_id_from_block(valid_prices[g_cheap].get("room_type") or "")
+                    room_exp   = self._room_id_from_block(valid_prices[g_exp].get("room_type") or "")
+                    if not room_cheap or not room_exp or room_cheap != room_exp:
                         continue  # Can't confirm same room type — skip
 
                     pct = (p_exp - p_cheap) / p_exp * 100
