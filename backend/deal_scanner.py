@@ -265,22 +265,24 @@ def get_featured_deals(db_path: str = DB_PATH, limit: int = 20,
             (min_savings, date.today().isoformat(), limit),
         ).fetchall()
     conn.close()
-    result = []
-    for raw, ci, co, tier, nights, city_name in rows:
-        try:
-            d = json.loads(raw)
-            # Only show deals bookable via the extension
-            if d.get("geo_country", "").upper() not in EXTENSION_GEOS:
-                continue
-            d["check_in"] = ci
-            d["check_out"] = co
-            d["tier"] = tier
-            d["nights"] = nights
-            d["city"] = city_name
-            result.append(d)
-        except Exception:
-            pass
-    return result
+    return [d for row in rows for d in [_row_to_deal(row)] if d]
+
+
+def _row_to_deal(row) -> Optional[dict]:
+    """Convert a DB row (raw_json, check_in, check_out, tier, nights, city) to a deal dict."""
+    raw, ci, co, tier, nights, city_name = row
+    try:
+        d = json.loads(raw)
+        if d.get("geo_country", "").upper() not in EXTENSION_GEOS:
+            return None
+        d["check_in"] = ci
+        d["check_out"] = co
+        d["tier"] = tier
+        d["nights"] = nights
+        d["city"] = city_name
+        return d
+    except Exception:
+        return None
 
 
 def get_scanner_stats(db_path: str = DB_PATH) -> dict:

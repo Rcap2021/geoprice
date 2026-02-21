@@ -1033,6 +1033,110 @@ async def get_featured_deals(limit: int = 20, city: Optional[str] = None):
         return {"deals": [], "cities": [], "error": str(e)}
 
 
+@app.get("/api/featured-deals/search")
+async def search_featured_deals(q: str = "", limit: int = 50):
+    """
+    Natural-language search over featured deals using Claude to parse intent.
+    Returns filtered + ranked deals matching the query.
+    """
+    import anthropic, json as _json, sqlite3 as _sql
+    db_path = os.getenv("DEAL_SCANNER_DB", "/tmp/geoprice_deals.db")
+    if not Path(db_path).exists():
+        return {"deals": [], "query": q}
+
+    # If empty query, return top deals
+    if not q.strip():
+        from deal_scanner import get_featured_deals as _get_deals
+        return {"deals": _get_deals(db_path, limit=limit), "query": q, "filters": {}}
+
+    # Use Claude Haiku to parse the query into structured filters
+    try:
+        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f'Parse this hotel deal search query into JSON filters.\n'
+                    f'Query: "{q}"\n\n'
+                    f'Available cities in DB: Bangkok, Paris, Singapore, London, Tokyo, Dubai, New York\n'
+                    f'Available tiers: budget, mid-range, luxury, ultra-luxury\n'
+                    f'Geo codes (2-letter): US GB IN MY SG JP HK CA FR PL MX ZA BD PK HU KZ CL KR AE AT AU CH DE ES IE IT KE NL NZ\n\n'
+                    f'Return ONLY valid JSON with these optional keys (null if not applicable):\n'
+                    f'{{"city": "city name or null", "tier": "tier or null", '
+                    f'"max_price_usd": number_or_null, "min_savings_pct": number_or_null, '
+                    f'"cheapest_geo": "2-letter code or null", "hotel_name": "partial name or null"}}'
+                )
+            }]
+        )
+        raw_text = msg.content[0].text.strip()
+        # Strip markdown code fences if present
+        if raw_text.startswith("```"):
+            raw_text = "\n".join(raw_text.split("\n")[1:])
+        if raw_text.endswith("```"):
+            raw_text = "\n".join(raw_text.split("\n")[:-1])
+        filters = _json.loads(raw_text.strip())
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger("geoprice.search").warning(f"Search LLM parse failed: {e} — falling back to text search")
+        filters = {}
+
+    import logging as _logging
+    _log = _logging.getLogger("geoprice.search")
+
+    # Build SQL from parsed filters
+    conn = _sql.connect(db_path)
+    where = ["savings_pct >= 5", "check_in >= ?"]
+    params: list = [date.today().isoformat()]
+
+    city_f = filters.get("city")
+    if city_f:
+        where.append("LOWER(city) LIKE ?")
+        params.append(f"%{city_f.lower()}%")
+
+    tier_f = filters.get("tier")
+    if tier_f:
+        where.append("tier = ?")
+        params.append(tier_f)
+
+    max_p = filters.get("max_price_usd")
+    if max_p:
+        where.append("cheapest_usd <= ?")
+        params.append(float(max_p))
+
+    min_s = filters.get("min_savings_pct")
+    if min_s:
+        where.append("savings_pct >= ?")
+        params.append(float(min_s))
+
+    geo_f = filters.get("cheapest_geo")
+    if geo_f:
+        where.append("cheapest_geo = ?")
+        params.append(geo_f.upper())
+
+    name_f = filters.get("hotel_name")
+    if name_f:
+        where.append("LOWER(hotel_name) LIKE ?")
+        params.append(f"%{name_f.lower()}%")
+
+    params.append(limit)
+    sql = (
+        f"SELECT raw_json, check_in, check_out, tier, nights, city "
+        f"FROM deals WHERE {' AND '.join(where)} ORDER BY savings_pct DESC LIMIT ?"
+    )
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except Exception as e:
+        _log.error(f"Search SQL failed: {e}")
+        rows = []
+    conn.close()
+
+    from deal_scanner import _row_to_deal
+    deals = [_row_to_deal(r) for r in rows if _row_to_deal(r)]
+    return {"deals": deals, "query": q, "filters": filters, "count": len(deals)}
+
+
 @app.post("/api/scanner/ingest")
 async def scanner_ingest(request: Request):
     """

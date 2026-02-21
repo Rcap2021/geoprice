@@ -177,91 +177,22 @@
         // ── Featured Deals (pre-scanned) ────────────────────────────────────────
 
         function FeaturedDeals({ onStartSearch, extensionInstalled }) {
-            const [deals, setDeals] = React.useState([]);
+            const [allDeals, setAllDeals] = React.useState([]);
+            const [searchDeals, setSearchDeals] = React.useState(null); // null = not searching
             const [cities, setCities] = React.useState([]);
             const [activeCity, setActiveCity] = React.useState('All');
             const [loading, setLoading] = React.useState(true);
+            const [searching, setSearching] = React.useState(false);
             const [stats, setStats] = React.useState(null);
             const [query, setQuery] = React.useState('');
+            const debounceRef = React.useRef(null);
 
-            // Country name → code map for geo search
-            const GEO_NAMES = {
-                'united states': 'US', 'usa': 'US', 'america': 'US',
-                'india': 'IN', 'uk': 'GB', 'united kingdom': 'GB', 'britain': 'GB',
-                'vietnam': 'VN', 'malaysia': 'MY', 'singapore': 'SG', 'japan': 'JP',
-                'hong kong': 'HK', 'canada': 'CA', 'france': 'FR', 'poland': 'PL',
-                'mexico': 'MX', 'south africa': 'ZA', 'bangladesh': 'BD', 'pakistan': 'PK',
-                'hungary': 'HU', 'kazakhstan': 'KZ', 'chile': 'CL', 'south korea': 'KR', 'korea': 'KR',
-                'uae': 'AE', 'dubai': 'AE', 'austria': 'AT', 'australia': 'AU',
-                'switzerland': 'CH', 'germany': 'DE', 'spain': 'ES', 'ireland': 'IE',
-                'italy': 'IT', 'kenya': 'KE', 'netherlands': 'NL', 'new zealand': 'NZ',
-                'brazil': 'BR', 'argentina': 'AR', 'indonesia': 'ID', 'thailand': 'TH',
-                'turkey': 'TR', 'portugal': 'PT', 'bulgaria': 'BG', 'serbia': 'RS',
-                'nigeria': 'NG', 'morocco': 'MA', 'tunisia': 'TN', 'peru': 'PE',
-                'slovakia': 'SK',
-            };
-
-            const matchesDeal = React.useCallback((deal, raw) => {
-                if (!raw.trim()) return true;
-                const q = raw.toLowerCase().trim();
-
-                // Price ceiling: must have explicit indicator "under $200", "$150", "below 300"
-                // Require a keyword OR dollar sign — don't blindly match bare numbers (would break "save 30%")
-                const priceMatch = q.match(/(?:(?:under|below|<|max)\s*\$?|(?:\$))(\d+)/);
-                const maxPrice = priceMatch ? parseFloat(priceMatch[1]) : null;
-                if (maxPrice && (deal.usd_price || 0) > maxPrice) return false;
-
-                // Savings floor: "save 20%", "30% off"
-                const savMatch = q.match(/(\d+)\s*%/);
-                const minSav = savMatch ? parseFloat(savMatch[1]) : null;
-                if (minSav && (deal.savings_percent || 0) < minSav) return false;
-
-                // Tier synonyms
-                const tierMap = { cheap: 'budget', hostel: 'budget', backpacker: 'budget',
-                                  mid: 'mid-range', midrange: 'mid-range', standard: 'mid-range',
-                                  luxury: 'luxury', upscale: 'luxury', premium: 'luxury',
-                                  ultra: 'ultra-luxury', 'ultra-luxury': 'ultra-luxury' };
-                for (const [word, tier] of Object.entries(tierMap)) {
-                    if (q.includes(word) && !(deal.tier || '').includes(tier)) return false;
-                }
-
-                // Resolve country name → code
-                let geoCode = null;
-                for (const [name, code] of Object.entries(GEO_NAMES)) {
-                    if (q.includes(name)) { geoCode = code; break; }
-                }
-
-                // Build searchable text: hotel name, city, tier, geo codes + country names
-                const haystack = [
-                    deal.hotel_name, deal.city, deal.tier,
-                    deal.geo_country, deal.geo_country_name,
-                    deal.baseline_geo, deal.baseline_geo_name,
-                ].filter(Boolean).join(' ').toLowerCase();
-
-                // Strip out tokens we already handled (price, %, tier words, country names)
-                const stopWords = [...Object.keys(tierMap), ...Object.keys(GEO_NAMES),
-                                   'under', 'below', 'above', 'save', 'savings', 'off', 'range',
-                                   'deal', 'deals', 'hotel', 'hotels', 'cheap', 'best', 'top'];
-                const textTokens = q.split(/\s+/).filter(t =>
-                    t.length > 1 && !/^\$?\d+%?$/.test(t) && !stopWords.includes(t)
-                );
-
-                // Geo filter if a country was named
-                if (geoCode) {
-                    const inCheap = (deal.geo_country || '') === geoCode;
-                    const inBase  = (deal.baseline_geo || '') === geoCode;
-                    if (!inCheap && !inBase) return false;
-                }
-
-                // Remaining text tokens must appear in haystack
-                return textTokens.every(tok => haystack.includes(tok));
-            }, []);
-
+            // Load all deals on mount
             React.useEffect(() => {
                 fetch(`${API_BASE}/api/featured-deals?limit=100`)
                     .then(r => r.json())
                     .then(data => {
-                        setDeals(data.deals || []);
+                        setAllDeals(data.deals || []);
                         const allCities = [...new Set((data.deals || []).map(d => d.city).filter(Boolean))];
                         setCities(allCities);
                         setStats(data.stats);
@@ -270,11 +201,35 @@
                     .catch(() => setLoading(false));
             }, []);
 
+            // Search handler with debounce — calls backend LLM search
+            const handleSearch = React.useCallback((q) => {
+                setQuery(q);
+                setActiveCity('All');
+                if (debounceRef.current) clearTimeout(debounceRef.current);
+                if (!q.trim()) {
+                    setSearchDeals(null);
+                    setSearching(false);
+                    return;
+                }
+                setSearching(true);
+                debounceRef.current = setTimeout(() => {
+                    fetch(`${API_BASE}/api/featured-deals/search?q=${encodeURIComponent(q)}&limit=100`)
+                        .then(r => r.json())
+                        .then(data => {
+                            setSearchDeals(data.deals || []);
+                            setSearching(false);
+                        })
+                        .catch(() => { setSearchDeals([]); setSearching(false); });
+                }, 600);
+            }, []);
+
+            // What to display
             const filtered = React.useMemo(() => {
-                let result = activeCity === 'All' ? deals : deals.filter(d => d.city === activeCity);
-                if (query.trim()) result = result.filter(d => matchesDeal(d, query));
-                return result;
-            }, [deals, activeCity, query, matchesDeal]);
+                if (searchDeals !== null) return searchDeals;
+                return activeCity === 'All' ? allDeals : allDeals.filter(d => d.city === activeCity);
+            }, [allDeals, searchDeals, activeCity]);
+
+            const deals = allDeals; // keep alias for stats display
 
             if (loading) return (
                 <div className="bg-white rounded-2xl p-8 text-center border border-gray-100 shadow-sm">
@@ -334,13 +289,16 @@
                         <input
                             type="text"
                             value={query}
-                            onChange={e => { setQuery(e.target.value); setActiveCity('All'); }}
-                            placeholder='Search deals… e.g. "Bangkok luxury", "Malaysia", "under $150", "save 20%"'
+                            onChange={e => handleSearch(e.target.value)}
+                            placeholder='Search deals… e.g. "Paris luxury", "Malaysia", "under $150", "save 30%"'
                             className="w-full pl-8 pr-8 py-2 text-sm border border-gray-200 rounded-xl bg-white focus:outline-none focus:border-indigo-400 focus:ring-1 focus:ring-indigo-200 transition-colors"
                         />
+                        {searching && (
+                            <span className="absolute right-8 top-1/2 -translate-y-1/2 text-xs text-indigo-400 animate-pulse">AI…</span>
+                        )}
                         {query && (
                             <button
-                                onClick={() => setQuery('')}
+                                onClick={() => handleSearch('')}
                                 className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 text-xs"
                             >✕</button>
                         )}
@@ -366,12 +324,15 @@
                     )}
 
                     {/* Result count when searching */}
-                    {query.trim() && (
+                    {query.trim() && !searching && (
                         <p className="text-xs text-gray-400 mb-2">
                             {filtered.length === 0
-                                ? 'No deals match — try different keywords'
+                                ? 'No deals match — try a different search'
                                 : `${filtered.length} deal${filtered.length !== 1 ? 's' : ''} found`}
                         </p>
+                    )}
+                    {query.trim() && searching && (
+                        <p className="text-xs text-indigo-400 mb-2 animate-pulse">Searching with AI…</p>
                     )}
 
                     {/* Deal cards */}
