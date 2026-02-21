@@ -1,8 +1,18 @@
-// GeoPrice Travel — Background Service Worker v1.4.2
+// GeoPrice Travel — Background Service Worker v1.4.3
 // Port-based geo proxy: each country has a dedicated port on hotels.chatleg.ai.
 // No tokens, no auth, no 407 challenges — just a PAC script pointing at the right port.
 
 const PROXY_HOST = 'hotels.chatleg.ai';
+
+// Flag emoji for each supported geo (used in toolbar badge)
+const GEO_FLAGS = {
+  AE: '🇦🇪', AT: '🇦🇹', AU: '🇦🇺', BD: '🇧🇩', CA: '🇨🇦',
+  CH: '🇨🇭', CL: '🇨🇱', DE: '🇩🇪', ES: '🇪🇸', FR: '🇫🇷',
+  GB: '🇬🇧', HK: '🇭🇰', HU: '🇭🇺', IE: '🇮🇪', IN: '🇮🇳',
+  IT: '🇮🇹', JP: '🇯🇵', KE: '🇰🇪', KR: '🇰🇷', KZ: '🇰🇿',
+  MX: '🇲🇽', MY: '🇲🇾', NL: '🇳🇱', NZ: '🇳🇿', PK: '🇵🇰',
+  PL: '🇵🇱', SG: '🇸🇬', US: '🇺🇸', VN: '🇻🇳', ZA: '🇿🇦',
+};
 
 // Geo → proxy port mapping (must match geo-proxy/main.go PORT_MAP)
 const GEO_PORTS = {
@@ -72,13 +82,36 @@ function _persist() {
   _updateBadge();
 }
 
-function _updateBadge() {
+async function _drawFlagIcon(flag) {
+  const sizes = [16, 32, 48, 128];
+  const imageData = {};
+  for (const size of sizes) {
+    const canvas = new OffscreenCanvas(size, size);
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, size, size);
+    ctx.font = `${Math.round(size * 0.85)}px serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(flag, size / 2, size / 2 + Math.round(size * 0.05));
+    imageData[size] = ctx.getImageData(0, 0, size, size);
+  }
+  return imageData;
+}
+
+async function _updateBadge() {
   const geo = manualGeo || (activeSessionId && sessions[activeSessionId]?.geo) || null;
   if (geo) {
-    chrome.action.setBadgeText({ text: geo });
-    chrome.action.setBadgeBackgroundColor({ color: '#6366f1' });
-    chrome.action.setTitle({ title: `GeoPrice — ${geo} proxy active` });
+    const flag = GEO_FLAGS[geo.toUpperCase()] || geo;
+    try {
+      const imageData = await _drawFlagIcon(flag);
+      chrome.action.setIcon({ imageData });
+    } catch (e) {
+      console.warn('[GeoPrice] OffscreenCanvas icon failed:', e);
+    }
+    chrome.action.setBadgeText({ text: '' });
+    chrome.action.setTitle({ title: `GeoPrice — ${GEO_PORTS[geo]?.name || geo} proxy active` });
   } else {
+    chrome.action.setIcon({ path: { 16: 'icons/icon16.png', 32: 'icons/icon32.png', 48: 'icons/icon48.png', 128: 'icons/icon128.png' } });
     chrome.action.setBadgeText({ text: '' });
     chrome.action.setTitle({ title: 'GeoPrice Travel' });
   }

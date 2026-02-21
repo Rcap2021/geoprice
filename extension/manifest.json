@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GeoPrice — Hotel Price Arbitrage",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "short_name": "GeoPrice",
   "description": "Find hotels up to 70% cheaper by comparing geo-targeted Booking.com prices. One click to book at the lowest global rate.",
   "homepage_url": "https://hotels.chatleg.ai",
