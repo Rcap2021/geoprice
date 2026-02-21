@@ -8,7 +8,11 @@ import json
 import re
 from typing import List, Tuple, Optional
 from datetime import date, datetime
+from pathlib import Path
+from dotenv import load_dotenv
 from anthropic import Anthropic
+
+load_dotenv(Path(__file__).parent / ".env")
 
 # Will be imported from main
 from pydantic import BaseModel

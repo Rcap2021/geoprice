@@ -83,6 +83,18 @@ class PriceEngine:
         "HK": {"name": "Hong Kong", "currency": "HKD", "locale": "zh-HK", "lang": "zh"},
         "FR": {"name": "France", "currency": "EUR", "locale": "fr-FR", "lang": "fr"},
         "CA": {"name": "Canada", "currency": "CAD", "locale": "en-CA", "lang": "en"},
+        # data.json additional geos
+        "AE": {"name": "UAE", "currency": "AED", "locale": "ar-AE", "lang": "ar"},
+        "AT": {"name": "Austria", "currency": "EUR", "locale": "de-AT", "lang": "de"},
+        "AU": {"name": "Australia", "currency": "AUD", "locale": "en-AU", "lang": "en"},
+        "CH": {"name": "Switzerland", "currency": "CHF", "locale": "de-CH", "lang": "de"},
+        "DE": {"name": "Germany", "currency": "EUR", "locale": "de-DE", "lang": "de"},
+        "ES": {"name": "Spain", "currency": "EUR", "locale": "es-ES", "lang": "es"},
+        "IE": {"name": "Ireland", "currency": "EUR", "locale": "en-IE", "lang": "en"},
+        "IT": {"name": "Italy", "currency": "EUR", "locale": "it-IT", "lang": "it"},
+        "KE": {"name": "Kenya", "currency": "KES", "locale": "en-KE", "lang": "en"},
+        "NL": {"name": "Netherlands", "currency": "EUR", "locale": "nl-NL", "lang": "nl"},
+        "NZ": {"name": "New Zealand", "currency": "NZD", "locale": "en-NZ", "lang": "en"},
     }
     
     # Approximate exchange rates (in production, fetch from API)
@@ -118,6 +130,11 @@ class PriceEngine:
         "SGD": 1.35,
         "HKD": 7.8,
         "CAD": 1.36,
+        "AED": 3.67,
+        "AUD": 1.60,
+        "CHF": 0.89,
+        "KES": 130.0,
+        "NZD": 1.68,
     }
     
     # Direct proxy mapping from data.json (addr:port, no auth required)
@@ -152,13 +169,26 @@ class PriceEngine:
         "HK": "79.127.248.201:8096",
         "FR": "174.138.161.194:8072",
         "CA": "23.235.247.82:8038",
+        "US": "23.111.180.230:8230",
+        # data.json additional geos
+        "AE": "174.138.161.154:8228",
+        "AT": "131.153.163.234:8014",
+        "AU": "174.138.165.138:8013",
+        "CH": "131.153.163.146:8211",
+        "DE": "174.138.167.250:8080",
+        "ES": "174.138.162.242:8202",
+        "IE": "174.138.162.138:8104",
+        "IT": "174.138.161.186:8106",
+        "KE": "131.153.163.218:8113",
+        "NL": "174.138.161.202:8155",
+        "NZ": "131.153.163.26:8158",
         # TR, TH, PT: no entries with ports in 8000-9000 range
     }
 
     # Hotel tier to star mapping for filtering
     TIER_STARS = {
-        "budget": [1, 2],
-        "mid-range": [3],
+        "budget": [1, 2, 3],
+        "mid-range": [4],
         "luxury": [5],
         "ultra-luxury": [5],
     }
@@ -177,33 +207,49 @@ class PriceEngine:
         # Concurrency settings
         self.max_concurrent = int(os.getenv("MAX_CONCURRENT_SCRAPERS", "4"))
         self.timeout = int(os.getenv("SCRAPE_TIMEOUT_MS", "90000"))
-        
+        # Max pages to scrape per geo per search.
+        # Live search: 2 (fast). Scanner daemon: 5 (comprehensive, set via env).
+        self.max_pages = int(os.getenv("MAX_PAGES_PER_GEO", "2"))
+
         # Debug mode - set to True to see browser
         self.headless = os.getenv("HEADLESS", "true").lower() == "true"
     
-    def _build_booking_url(self, intent: TravelIntent, currency: str = "USD") -> str:
-        """Build Booking.com search URL"""
-        base = "https://www.booking.com/searchresults.html"
-        
-        # Star filter based on tier
+    def _build_booking_url(self, intent: TravelIntent, currency: str = "USD", offset: int = 0) -> str:
+        """Build Booking.com search URL.
+
+        Always uses USD so all geo prices are directly comparable.
+        changed_currency=1 is required to actually apply the currency override.
+        The arbitrage exists because Booking.com applies geo-IP-based price tiers
+        regardless of currency — same hotel costs less when browsed from certain countries.
+        """
+        # Use en-us locale in path so results are in English
+        base = "https://www.booking.com/searchresults.en-us.html"
+
+        # Star filter: single nflt param (Booking.com supports one class at a time)
         star_filter = ""
         if intent.hotel_tier and intent.hotel_tier in self.TIER_STARS:
             stars = self.TIER_STARS[intent.hotel_tier]
-            star_filter = "&".join([f"nflt=class%3D{s}" for s in stars])
-        
+            # Use the primary star value for the tier
+            star_filter = f"nflt=class%3D{stars[0]}"
+
         params = {
             "ss": intent.destination_city,
             "checkin": intent.check_in.isoformat() if intent.check_in else "",
             "checkout": intent.check_out.isoformat() if intent.check_out else "",
             "group_adults": str(intent.guests),
             "no_rooms": str(intent.rooms),
-            "selected_currency": currency,
+            "selected_currency": "USD",   # Always USD for direct comparison
+            "changed_currency": "1",      # REQUIRED: forces Booking.com to apply currency
+            "lang": "en-us",
+            "sb_travel_purpose": "leisure",
         }
-        
+        if offset > 0:
+            params["offset"] = str(offset)
+
         query = "&".join([f"{k}={v}" for k, v in params.items() if v])
         if star_filter:
             query += "&" + star_filter
-            
+
         return f"{base}?{query}"
     
     def _get_proxy_for_geo(self, geo_code: str) -> Optional[Dict[str, str]]:
@@ -225,9 +271,6 @@ class PriceEngine:
 
         # Option 2: Direct proxy from GEO_PROXIES (no auth required)
         if self.proxy_format == "direct":
-            # US baseline: the server itself is in the US — no proxy needed
-            if geo_code == "US":
-                return None
             server = self.GEO_PROXIES.get(geo_code)
             if server:
                 return {"server": f"http://{server}"}
@@ -342,9 +385,9 @@ class PriceEngine:
         proxy = self._get_proxy_for_geo(geo_code)
         if proxy:
             context_options["proxy"] = proxy
-        elif self.proxy_format == "direct" and geo_code != "US":
+        elif self.proxy_format == "direct":
             # No proxy available for this geo in direct mode — skip to avoid
-            # scraping with the server's own IP (which gives US prices)
+            # scraping with the server's own IP (gives wrong geo prices)
             print(f"[{geo_code}] No proxy available — skipping")
             return []
 
@@ -371,69 +414,82 @@ class PriceEngine:
             except Exception:
                 pass  # If homepage times out, still try the search
 
-            # Navigate to search — force USD so all geos use the same DOM/currency,
-            # avoiding exchange-rate errors and locale-specific price selector failures.
-            url = self._build_booking_url(intent, "USD")
-            print(f"[{geo_code}] Scraping: {url}")
+            # Paginate — 25 hotels/page, up to self.max_pages pages.
+            # Stop only when a page returns 0 cards (genuine end of results).
+            PAGE_SIZE = 25
+            MAX_HOTELS = self.max_pages * PAGE_SIZE
+            all_hotels_raw = []
+            seen_ids: set = set()
 
-            await page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
+            for page_offset in range(0, MAX_HOTELS, PAGE_SIZE):
+                url = self._build_booking_url(intent, "USD", offset=page_offset)
+                if page_offset == 0:
+                    print(f"[{geo_code}] Scraping: {url}")
+                else:
+                    print(f"[{geo_code}] Page offset={page_offset}")
 
-            # Wait for results to load
-            try:
-                await page.wait_for_selector('[data-testid="property-card"]', timeout=20000)
-            except PlaywrightTimeout:
-                print(f"[{geo_code}] No results found or timeout")
-                return []
+                await page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
 
-            # Small delay for dynamic content
-            await asyncio.sleep(2)
-            
-            # Extract hotel data
-            hotels = await page.evaluate('''() => {
+                # Wait for results to load
+                try:
+                    await page.wait_for_selector('[data-testid="property-card"]', timeout=20000)
+                except PlaywrightTimeout:
+                    if page_offset == 0:
+                        print(f"[{geo_code}] No results found or timeout")
+                        return []
+                    else:
+                        print(f"[{geo_code}] No more results at offset={page_offset}")
+                        break
+
+                await asyncio.sleep(1)
+
+                # Extract hotel data from this page
+                page_hotels = await page.evaluate('''() => {
                 const cards = document.querySelectorAll('[data-testid="property-card"]');
-                return Array.from(cards).slice(0, 15).map(card => {
+                return Array.from(cards).map(card => {
                     // Hotel name
                     const nameEl = card.querySelector('[data-testid="title"]');
                     const name = nameEl ? nameEl.innerText.trim() : '';
                     
-                    // Price - try multiple selectors
+                    // Price extraction
                     let price = '';
                     let taxText = '';
+                    let isPerNight = false;  // true = price is per-night, false = price is total stay
                     const priceEl = card.querySelector('[data-testid="price-and-discounted-price"]')
                         || card.querySelector('.bui-price-display__value')
                         || card.querySelector('[class*="price"]');
                     if (priceEl) {
                         price = priceEl.innerText.trim();
-                        // Walk up to find a container that also holds taxes/fees text.
-                        // Booking.com shows tax text in the local language, so we match
-                        // keywords from all 32 supported country languages.
+
+                        // Walk up to find the price section container
                         let container = priceEl.parentElement;
                         for (let i = 0; i < 8 && container; i++) {
                             const text = container.innerText || '';
-                            // Multilingual tax keywords:
-                            // EN: tax, fee, charge
-                            // ES (AR,MX,PE,CL): impuest(o/os), cargo(s), tasa(s)
-                            // PT (BR,PT): imposto(s), taxa(s)
-                            // FR (FR,MA,TN): taxe(s), frais
-                            // ID: pajak, biaya
-                            // HU: adó, díj
-                            // PL: podatek, opłat(a)
-                            // BG: данък, такса
-                            // SR/HR: porez, naknada
-                            // SK: daň
-                            // VI: thuế, phí
-                            // MS (MY): cukai
-                            // TR: vergi
-                            // KZ: салық
-                            // ZH (HK): 稅 / JA (JP): 税 / KO (KR): 세금 / TH: ภาษี
-                            // AR (MA,TN): ضريبة، رسوم
-                            const taxMatch = text.match(
-                                /\+\s*[^\d]*[\d.,]+[^\d]*(?:tax|fee|charge|impuest|cargo|tasa|imposto|taxa|taxe|frais|pajak|biaya|ad[oó]|d[ií]j|podatek|op[łl]at|данък|такса|porez|naknada|da[nň]|thu[eế]|ph[ií]|cukai|vergi|салық|稅|税|세금|ภาษี|ضريبة|رسوم)/iu
+
+                            // Detect per-night label (US and some other locales)
+                            if (/per\s*night|\/night|night\s*price/i.test(text)) {
+                                isPerNight = true;
+                            }
+
+                            // Tax with "+" prefix (most non-US locales):
+                            // "+ $XX taxes / impuesto / taxe / ..."
+                            const taxMatchPlus = text.match(
+                                /[+＋]\s*[^\d]*[\d.,]+[^\d]*(?:tax|fee|charge|impuest|cargo|tasa|imposto|taxa|taxe|frais|pajak|biaya|ad[oó]|d[ií]j|podatek|op[łl]at|данък|такса|porez|naknada|da[nň]|thu[eế]|ph[ií]|cukai|vergi|салық|टैक्स|शुल्क|手数料|税|稅|세금|ภาษี|ضريبة|رسوم)/iu
                             );
-                            if (taxMatch) {
-                                taxText = taxMatch[0];
+                            if (taxMatchPlus) {
+                                taxText = taxMatchPlus[0];
                                 break;
                             }
+
+                            // Tax without "+" prefix (US locale: "Taxes and fees: $XX"):
+                            const taxMatchUS = text.match(
+                                /(?:taxes?\s+(?:and\s+)?fees?|charges?)[^\d]*\$?\s*([\d.,]+)/i
+                            );
+                            if (taxMatchUS) {
+                                taxText = taxMatchUS[0];
+                                break;
+                            }
+
                             container = container.parentElement;
                         }
                     }
@@ -463,9 +519,21 @@ class PriceEngine:
                     const link = linkEl ? linkEl.href : '';
                     
                     // Hotel ID from link
+                    // URL format: /hotel/{country_code}/{hotel-slug}.html
+                    // e.g. /hotel/fr/hotel-minerve.html → hotel-minerve
                     let hotelId = '';
-                    const idMatch = link.match(/hotel\\/([^/]+)\\.html/);
+                    const idMatch = link.match(/\\/hotel\\/[a-z]{2}\\/([^./?]+)/);
                     if (idMatch) hotelId = idMatch[1];
+
+                    // Room block ID — identifies the specific room type.
+                    // Format: all_sr_blocks=HOTELID_ROOMNUM_OCC_MEAL_?
+                    // Same block prefix across geos = same room type = valid price comparison.
+                    let roomBlockId = '';
+                    const blockMatch = link.match(/all_sr_blocks=([^&]+)/);
+                    if (blockMatch) {
+                        // Strip the price suffix (__XXXXX) if present
+                        roomBlockId = blockMatch[1].split('__')[0];
+                    }
                     
                     // Free cancellation
                     const freeCancelEl = card.querySelector('[data-testid="free-cancellation-badge"]');
@@ -478,30 +546,57 @@ class PriceEngine:
                         name,
                         price,
                         taxText,
+                        isPerNight,
                         stars,
                         reviewScore,
                         location,
                         link,
                         hotelId,
+                        roomBlockId,
                         freeCancel,
                         breakfast: breakfastEl
                     };
                 }).filter(h => h.name && h.price);
-            }''')
-            
-            # Booking.com shows per-night prices on all locales
+                }''')
+
+                # Deduplicate across pages by hotelId
+                new_count = 0
+                for h in page_hotels:
+                    uid = h.get("hotelId") or h.get("name", "").lower().replace(" ", "-")
+                    if uid and uid not in seen_ids:
+                        seen_ids.add(uid)
+                        all_hotels_raw.append(h)
+                        new_count += 1
+
+                print(f"[{geo_code}] offset={page_offset}: {len(page_hotels)} cards, {new_count} new (total {len(all_hotels_raw)})")
+
+                # Stop when Booking.com returns an empty page (no more results).
+                # Do NOT stop on new_count==0 — we still try all pages even if
+                # this page happened to be all duplicates (happens with some geos).
+                if len(page_hotels) == 0:
+                    break
+
+            # Booking.com shows per-night prices in some locales — compute stay length
             nights = 1
             if intent.check_in and intent.check_out:
                 nights = max(1, (intent.check_out - intent.check_in).days)
 
-            # Parse and normalize results — all prices are in USD (forced above)
-            for hotel in hotels:
-                price_value = self._parse_price(hotel["price"], "USD") * nights
-                # Add taxes/fees if shown separately
+            # All prices are in USD (changed_currency=1&selected_currency=USD in URL).
+            # Arbitrage exists because Booking.com applies geo-IP-based pricing tiers
+            # in the requested currency — same hotel is cheaper from some countries.
+            for hotel in all_hotels_raw:
+                # isPerNight=True  → multiply by stay length
+                # isPerNight=False → total stay price, use as-is
+                is_per_night = hotel.get("isPerNight", True)
+                raw_price = self._parse_price(hotel["price"], "USD")
+                price_value = raw_price * nights if is_per_night else raw_price
+
+                # Taxes follow the same per-night / total convention as the main price
                 tax_value = self._parse_price(hotel.get("taxText", ""), "USD")
                 if tax_value > 0:
-                    price_value += tax_value * nights
-                    print(f"[{geo_code}] Tax added for {hotel['name']}: +${tax_value:.2f}")
+                    tax_total = tax_value * nights if is_per_night else tax_value
+                    price_value += tax_total
+
                 if price_value > 0:
                     results.append({
                         "hotel_name": hotel["name"],
@@ -511,15 +606,15 @@ class PriceEngine:
                         "geo_country": geo_code,
                         "geo_price": price_value,
                         "geo_currency": "USD",
-                        "usd_price": price_value,  # already USD, no conversion needed
-                        "room_type": None,
+                        "usd_price": price_value,  # Already in USD
+                        "room_type": hotel.get("roomBlockId") or None,
                         "includes_breakfast": hotel["breakfast"],
                         "free_cancellation": hotel["freeCancel"],
                         "review_score": hotel["reviewScore"],
                         "booking_url": hotel["link"],
                     })
-            
-            print(f"[{geo_code}] Found {len(results)} hotels")
+
+            print(f"[{geo_code}] Found {len(results)} hotels total")
             
         except Exception as e:
             print(f"[{geo_code}] Scraping error: {e}")
@@ -553,10 +648,13 @@ class PriceEngine:
             else:
                 cleaned = cleaned.replace(',', '')
         elif '.' in cleaned:
-            # Dot only: could be decimal (46.5) or European thousands (46.259)
+            # Dot only: could be decimal (46.5) or European thousands (46.259 / 2.000.000)
             parts = cleaned.split('.')
             if len(parts) == 2 and len(parts[-1]) == 3:
-                # European thousands separator: 46.259 → 46259
+                # Single dot as thousands separator: 46.259 → 46259
+                cleaned = cleaned.replace('.', '')
+            elif len(parts) > 2 and all(len(p) == 3 for p in parts[1:]):
+                # Multiple dots as thousands separators: 2.000.000 → 2000000 (IDR, ARS, etc.)
                 cleaned = cleaned.replace('.', '')
             # else: normal decimal like 46.50 — leave as-is
 
@@ -664,14 +762,33 @@ class PriceEngine:
             finally:
                 await browser.close()
     
+    @staticmethod
+    def _is_specific_block(block_id: str) -> bool:
+        """Return True if block_id represents a specific, matched room type.
+
+        Booking.com uses all_sr_blocks=HOTEL_ROOM_OCC_MEAL_BOARD in URLs.
+        When the hotel appears but no specific room was matched, the block
+        becomes 0_0_OCC_0_0 (hotel and room IDs are zero).  We must reject
+        these generic placeholders — they can represent any room in the hotel,
+        so comparing them against a specific block from another geo is invalid.
+        """
+        if not block_id:
+            return False
+        parts = block_id.split("_")
+        # First two segments must be non-zero: hotel_id and room_block_id
+        return len(parts) >= 2 and parts[0] != "0" and parts[1] != "0"
+
     def calculate_best_deals(
-        self, 
+        self,
         all_results: Dict[str, List[Dict[str, Any]]],
         baseline_geo: str = "US"
     ) -> List[Dict[str, Any]]:
         """
         Calculate best deals across all geos.
         Compares each hotel's price across geos and finds the best savings.
+        Only considers geo pairs where BOTH have the same specific room block ID
+        (non-zero hotel+room segments in all_sr_blocks) — ensures we're comparing
+        the exact same room type, not different rooms at the same hotel.
         """
         # Group hotels by ID/name
         hotels_by_id = {}
@@ -715,36 +832,73 @@ class PriceEngine:
             valid_prices = {g: p for g, p in prices.items() if p["usd_price"] >= 5}
             if not valid_prices:
                 continue
-            cheapest_geo = min(valid_prices.keys(), key=lambda g: valid_prices[g]["usd_price"])
-            cheapest = valid_prices[cheapest_geo]
 
-            # Calculate savings
-            savings_usd = baseline_price - cheapest["usd_price"]
-            savings_percent = (savings_usd / baseline_price * 100) if baseline_price > 0 else 0
+            # Compare ALL geo pairs — find the single best saving combo
+            # where cheapest_geo vs expensive_geo have the same room block ID.
+            best_saving_pct = 0
+            best_cheap_geo = None
+            best_exp_geo = None
 
-            # Only include if there are actual savings
-            if savings_percent >= 1:  # At least 1% savings
-                best_deals.append({
+            geo_list = list(valid_prices.keys())
+            for i, g_cheap in enumerate(geo_list):
+                for g_exp in geo_list:
+                    if g_cheap == g_exp:
+                        continue
+                    p_cheap = valid_prices[g_cheap]["usd_price"]
+                    p_exp   = valid_prices[g_exp]["usd_price"]
+                    if p_exp <= p_cheap:
+                        continue
+
+                    # Room block matching: both must have the same SPECIFIC block ID.
+                    # Generic blocks (0_0_OCC_0_0) are placeholders — reject them.
+                    block_cheap = valid_prices[g_cheap].get("room_type") or ""
+                    block_exp   = valid_prices[g_exp].get("room_type") or ""
+                    if not (
+                        self._is_specific_block(block_cheap)
+                        and self._is_specific_block(block_exp)
+                        and block_cheap == block_exp
+                    ):
+                        continue  # Can't confirm same room type — skip
+
+                    pct = (p_exp - p_cheap) / p_exp * 100
+                    if pct > best_saving_pct:
+                        best_saving_pct = pct
+                        best_cheap_geo  = g_cheap
+                        best_exp_geo    = g_exp
+
+            # Also record all geo prices for debug/display
+            all_geo_prices = {g: round(p["usd_price"], 2) for g, p in valid_prices.items()}
+
+            if best_cheap_geo is None or best_saving_pct < 1:
+                continue
+
+            cheapest  = valid_prices[best_cheap_geo]
+            expensive = valid_prices[best_exp_geo]
+            savings_usd = expensive["usd_price"] - cheapest["usd_price"]
+
+            best_deals.append({
                     "hotel_name": hotel_data["hotel_name"],
                     "hotel_id": hotel_id,
                     "stars": hotel_data.get("stars"),
                     "location": hotel_data.get("location"),
                     "review_score": hotel_data.get("review_score"),
-                    "geo_country": cheapest_geo,
-                    "geo_country_name": self.GEO_COUNTRIES[cheapest_geo]["name"],
+                    "geo_country": best_cheap_geo,
+                    "geo_country_name": self.GEO_COUNTRIES[best_cheap_geo]["name"],
                     "geo_price": cheapest["geo_price"],
                     "geo_currency": cheapest["geo_currency"],
                     "usd_price": cheapest["usd_price"],
-                    "baseline_usd_price": baseline_price,
-                    "baseline_geo": effective_baseline_geo,
-                    "baseline_geo_name": self.GEO_COUNTRIES.get(effective_baseline_geo, {}).get("name", effective_baseline_geo),
-                    "savings_percent": round(savings_percent, 1),
+                    "baseline_usd_price": expensive["usd_price"],
+                    "baseline_geo": best_exp_geo,
+                    "baseline_geo_name": self.GEO_COUNTRIES.get(best_exp_geo, {}).get("name", best_exp_geo),
+                    "savings_percent": round(best_saving_pct, 1),
                     "savings_usd": round(savings_usd, 2),
                     "includes_breakfast": cheapest.get("includes_breakfast", False),
                     "free_cancellation": cheapest.get("free_cancellation", False),
                     "booking_url": cheapest["booking_url"],
-                    "baseline_url": baseline.get("booking_url", ""),
-                })
+                    "baseline_url": expensive.get("booking_url", ""),
+                    "all_geo_prices": all_geo_prices,  # Full price matrix for debug
+                    "us_price": valid_prices.get("US", {}).get("usd_price"),  # Always include US price
+            })
         
         # Sort by savings percentage
         best_deals.sort(key=lambda x: x["savings_percent"], reverse=True)

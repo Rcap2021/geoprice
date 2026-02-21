@@ -1,16 +1,30 @@
 {
   "manifest_version": 3,
-  "name": "GeoPrice Travel",
-  "version": "1.0.0",
-  "description": "Book hotels at geo-targeted prices — instant, no remote browser needed.",
-  "permissions": ["proxy", "tabs", "storage", "webRequest", "webRequestAuthProvider"],
+  "name": "GeoPrice — Hotel Price Arbitrage",
+  "version": "1.4.2",
+  "short_name": "GeoPrice",
+  "description": "Find hotels up to 70% cheaper by comparing geo-targeted Booking.com prices. One click to book at the lowest global rate.",
+  "homepage_url": "https://hotels.chatleg.ai",
+  "author": "GeoPrice Travel",
+
+  "permissions": [
+    "proxy",
+    "tabs",
+    "storage",
+    "webRequest"
+  ],
   "host_permissions": [
     "https://hotels.chatleg.ai/*",
-    "https://*.booking.com/*"
+    "https://*.booking.com/*",
+    "http://ip-api.com/*",
+    "http://demo.ip-api.com/*"
   ],
+
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
+
   "content_scripts": [
     {
       "matches": ["https://hotels.chatleg.ai/*"],
@@ -18,15 +32,24 @@
       "run_at": "document_start"
     }
   ],
+
   "action": {
     "default_popup": "popup.html",
+    "default_title": "GeoPrice Travel",
     "default_icon": {
-      "48": "icons/icon48.png",
+      "16":  "icons/icon16.png",
+      "32":  "icons/icon32.png",
+      "48":  "icons/icon48.png",
       "128": "icons/icon128.png"
     }
   },
+
   "icons": {
-    "48": "icons/icon48.png",
+    "16":  "icons/icon16.png",
+    "32":  "icons/icon32.png",
+    "48":  "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+
+  "minimum_chrome_version": "102"
 }

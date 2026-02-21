@@ -27,7 +27,7 @@
     <div id="root"></div>
 
     <script type="text/babel">
-        const { useState, useEffect, useRef } = React;
+        const { useState, useEffect, useRef, useCallback } = React;
 
         // Use relative URLs — works regardless of which server/IP hosts the app
         const API_BASE = '';
@@ -174,14 +174,154 @@
             );
         }
 
+        // ── Featured Deals (pre-scanned) ────────────────────────────────────────
+
+        function FeaturedDeals({ onStartSearch, extensionInstalled }) {
+            const [deals, setDeals] = React.useState([]);
+            const [cities, setCities] = React.useState([]);
+            const [activeCity, setActiveCity] = React.useState('All');
+            const [loading, setLoading] = React.useState(true);
+            const [stats, setStats] = React.useState(null);
+
+            React.useEffect(() => {
+                fetch(`${API_BASE}/api/featured-deals?limit=40`)
+                    .then(r => r.json())
+                    .then(data => {
+                        setDeals(data.deals || []);
+                        const allCities = [...new Set((data.deals || []).map(d => d.city).filter(Boolean))];
+                        setCities(allCities);
+                        setStats(data.stats);
+                        setLoading(false);
+                    })
+                    .catch(() => setLoading(false));
+            }, []);
+
+            const filtered = activeCity === 'All' ? deals : deals.filter(d => d.city === activeCity);
+
+            if (loading) return (
+                <div className="bg-white rounded-2xl p-8 text-center border border-gray-100 shadow-sm">
+                    <div className="flex justify-center space-x-1 mb-3">
+                        <div className="w-2 h-2 bg-indigo-400 rounded-full typing-dot"></div>
+                        <div className="w-2 h-2 bg-indigo-400 rounded-full typing-dot"></div>
+                        <div className="w-2 h-2 bg-indigo-400 rounded-full typing-dot"></div>
+                    </div>
+                    <p className="text-sm text-gray-400">Loading featured deals…</p>
+                </div>
+            );
+
+            if (deals.length === 0) return (
+                <div className="bg-white rounded-2xl p-8 text-center border border-gray-100 shadow-sm">
+                    <div className="text-4xl mb-3">🔍</div>
+                    <h3 className="font-semibold text-gray-700 mb-2">How it works</h3>
+                    <p className="text-sm text-gray-500 mb-4">Tell me your destination and travel dates. I'll check Booking.com prices from 32 countries and show you where the same hotel is cheapest.</p>
+                    <div className="grid grid-cols-3 gap-3 text-xs text-gray-500">
+                        <div className="bg-indigo-50 rounded-lg p-3">
+                            <div className="text-2xl mb-1">💬</div>
+                            <p className="font-medium text-gray-700">Chat</p>
+                            <p>Tell me where &amp; when</p>
+                        </div>
+                        <div className="bg-purple-50 rounded-lg p-3">
+                            <div className="text-2xl mb-1">🌍</div>
+                            <p className="font-medium text-gray-700">Search</p>
+                            <p>32 countries checked</p>
+                        </div>
+                        <div className="bg-green-50 rounded-lg p-3">
+                            <div className="text-2xl mb-1">💰</div>
+                            <p className="font-medium text-gray-700">Save</p>
+                            <p>Up to 40% cheaper</p>
+                        </div>
+                    </div>
+                </div>
+            );
+
+            return (
+                <div>
+                    {/* Header */}
+                    <div className="flex items-center justify-between mb-3">
+                        <div>
+                            <h2 className="font-bold text-gray-800 text-base">🔥 Top Deals Right Now</h2>
+                            {stats && <p className="text-xs text-gray-400 mt-0.5">{stats.total_deals} deals scanned · updated every 12h</p>}
+                        </div>
+                        <button
+                            onClick={onStartSearch}
+                            className="text-xs text-indigo-600 hover:text-indigo-800 font-medium border border-indigo-200 px-3 py-1.5 rounded-lg hover:bg-indigo-50 transition-colors"
+                        >
+                            Search your dates →
+                        </button>
+                    </div>
+
+                    {/* City tabs */}
+                    {cities.length > 1 && (
+                        <div className="flex gap-2 overflow-x-auto pb-2 mb-3 scrollbar-hide">
+                            {['All', ...cities].map(city => (
+                                <button
+                                    key={city}
+                                    onClick={() => setActiveCity(city)}
+                                    className={`flex-shrink-0 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
+                                        activeCity === city
+                                            ? 'bg-indigo-600 text-white'
+                                            : 'bg-white border border-gray-200 text-gray-600 hover:border-indigo-300'
+                                    }`}
+                                >
+                                    {city}
+                                </button>
+                            ))}
+                        </div>
+                    )}
+
+                    {/* Deal cards */}
+                    <div className="space-y-3">
+                        {filtered.map((deal, idx) => (
+                            <DealCard
+                                key={`${deal.hotel_id}-${deal.check_in}`}
+                                deal={deal}
+                                rank={idx + 1}
+                                extensionInstalled={extensionInstalled}
+                                showDates={true}
+                            />
+                        ))}
+                    </div>
+                </div>
+            );
+        }
+
         // Deal Card — shows cheapest-geo button + US comparison button
-        function DealCard({ deal, rank }) {
+        function DealCard({ deal, rank, extensionInstalled, showDates }) {
             const [browseLoading, setBrowseLoading] = React.useState(false);
+            const [extLoading, setExtLoading] = React.useState(false);
             const stars = deal.stars ? '★'.repeat(deal.stars) : '';
             const flag = COUNTRY_FLAGS[deal.geo_country] || '🌍';
             const baseFlag = COUNTRY_FLAGS[deal.baseline_geo || 'US'] || '🇺🇸';
             const savingsPct = deal.savings_percent || 0;
             const badgeColor = savingsPct >= 20 ? 'bg-green-500' : savingsPct >= 10 ? 'bg-emerald-400' : 'bg-teal-400';
+
+            const handleBookViaExtension = async () => {
+                setExtLoading(true);
+                try {
+                    const res = await fetch(`${API_BASE}/api/proxy-token`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ geo_country: deal.geo_country })
+                    });
+                    if (!res.ok) {
+                        const err = await res.json();
+                        alert(`Could not create proxy token: ${err.detail || 'Unknown error'}`);
+                        return;
+                    }
+                    const { token } = await res.json();
+                    // Post message to extension content script
+                    window.postMessage({
+                        type: 'GEOPRICE_OPEN',
+                        token,
+                        booking_url: deal.booking_url,
+                        geo: deal.geo_country
+                    }, '*');
+                } catch (e) {
+                    alert('Connection error. Please try again.');
+                } finally {
+                    setExtLoading(false);
+                }
+            };
 
             const handleBookCheapest = async () => {
                 setBrowseLoading(true);
@@ -190,8 +330,11 @@
                 const newTab = window.open('', '_blank');
                 if (newTab) {
                     newTab.document.write(
-                        `<html><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f5f7ff">` +
-                        `<p style="color:#4f46e5;font-size:1.1rem">Opening ${deal.geo_country_name || deal.geo_country} browser, please wait…</p>` +
+                        `<html><body style="font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;background:#f5f7ff;gap:12px">` +
+                        `<div style="font-size:2.5rem">🌍</div>` +
+                        `<p style="color:#4f46e5;font-size:1.1rem;font-weight:600;margin:0">Starting ${deal.geo_country_name || deal.geo_country} browser…</p>` +
+                        `<p style="color:#6b7280;font-size:0.9rem;margin:0">This takes 10–15 seconds. You will be redirected automatically.</p>` +
+                        `<p style="color:#6b7280;font-size:0.85rem;margin:0">When the browser opens, click <strong>Connect</strong> — the password is pre-filled.</p>` +
                         `</body></html>`
                     );
                 }
@@ -221,6 +364,8 @@
                 }
             };
 
+            const fmtDate = (d) => d ? new Date(d + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '';
+
             return (
                 <div className="bg-white rounded-xl shadow-sm border border-gray-100 deal-card transition-all hover:shadow-md overflow-hidden">
                     {/* Top row: rank + name + savings badge */}
@@ -231,7 +376,17 @@
                         <div className="flex-1 min-w-0">
                             <h4 className="font-semibold text-gray-800 text-sm leading-tight truncate">{deal.hotel_name}</h4>
                             <p className="text-xs text-gray-400 mt-0.5 truncate">{deal.location}</p>
-                            {stars && <p className="text-yellow-400 text-xs mt-0.5">{stars}</p>}
+                            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                                {stars && <p className="text-yellow-400 text-xs">{stars}</p>}
+                                {showDates && deal.check_in && (
+                                    <span className="text-xs bg-indigo-50 text-indigo-600 px-1.5 py-0.5 rounded font-medium">
+                                        {fmtDate(deal.check_in)} · {deal.nights || (deal.check_out ? Math.round((new Date(deal.check_out)-new Date(deal.check_in))/86400000) : '?')}n
+                                    </span>
+                                )}
+                                {showDates && deal.city && (
+                                    <span className="text-xs text-gray-400">{deal.city}</span>
+                                )}
+                            </div>
                         </div>
                         <div className={`flex-shrink-0 ${badgeColor} text-white px-2.5 py-1 rounded-full text-xs font-bold`}>
                             Save {savingsPct}%
@@ -265,43 +420,66 @@
                         </div>
                     )}
 
-                    {/* Two booking buttons */}
-                    <div className="flex gap-2 px-4 pb-4 pt-2">
-                        <button
-                            onClick={handleBookCheapest}
-                            disabled={browseLoading}
-                            className="flex-1 text-center bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white px-3 py-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
-                        >
-                            {browseLoading
-                                ? `Opening ${deal.geo_country_name || deal.geo_country} browser...`
-                                : `${flag} Book Cheapest (${deal.geo_country})`
-                            }
-                        </button>
-                        {deal.baseline_url ? (
-                            <a
-                                href={deal.baseline_url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="flex-1 text-center bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 rounded-lg text-xs font-semibold transition-colors"
+                    {/* Booking buttons */}
+                    <div className="flex flex-col gap-2 px-4 pb-4 pt-2">
+                        {/* Primary: Extension button (instant) or remote browser (slow) */}
+                        {extensionInstalled ? (
+                            <button
+                                onClick={handleBookViaExtension}
+                                disabled={extLoading}
+                                className="w-full text-center bg-green-600 hover:bg-green-700 disabled:bg-green-400 text-white px-3 py-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
                             >
-                                {baseFlag} Compare {deal.baseline_geo || 'US'} Price
-                            </a>
+                                {extLoading ? 'Opening...' : `⚡ Book via Extension (${deal.geo_country})`}
+                            </button>
                         ) : (
-                            <a
-                                href={`https://www.booking.com/search.html?ss=${encodeURIComponent(deal.hotel_name)}`}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="flex-1 text-center bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 rounded-lg text-xs font-semibold transition-colors"
+                            <button
+                                onClick={handleBookCheapest}
+                                disabled={browseLoading}
+                                className="w-full text-center bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white px-3 py-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
                             >
-                                Search on Booking.com
-                            </a>
+                                {browseLoading
+                                    ? `Opening ${deal.geo_country_name || deal.geo_country} browser...`
+                                    : `${flag} Book Cheapest (${deal.geo_country})`
+                                }
+                            </button>
                         )}
+                        {/* Secondary row: compare price + remote browser fallback when ext installed */}
+                        <div className="flex gap-2">
+                            {extensionInstalled && (
+                                <button
+                                    onClick={handleBookCheapest}
+                                    disabled={browseLoading}
+                                    className="flex-1 text-center bg-indigo-50 hover:bg-indigo-100 text-indigo-700 px-3 py-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
+                                >
+                                    {browseLoading ? 'Opening...' : `${flag} Remote Browser`}
+                                </button>
+                            )}
+                            {deal.baseline_url ? (
+                                <a
+                                    href={deal.baseline_url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="flex-1 text-center bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 rounded-lg text-xs font-semibold transition-colors"
+                                >
+                                    {baseFlag} Compare {deal.baseline_geo || 'US'} Price
+                                </a>
+                            ) : (
+                                <a
+                                    href={`https://www.booking.com/search.html?ss=${encodeURIComponent(deal.hotel_name)}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="flex-1 text-center bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 rounded-lg text-xs font-semibold transition-colors"
+                                >
+                                    Search on Booking.com
+                                </a>
+                            )}
+                        </div>
                     </div>
                 </div>
             );
         }
 
-        function ResultsPanel({ deals, searching }) {
+        function ResultsPanel({ deals, searching, extensionInstalled }) {
             if (!deals || deals.length === 0) {
                 return <div className="text-center py-8 text-gray-400 text-sm">No deals yet — start a search!</div>;
             }
@@ -331,9 +509,50 @@
                     </div>
                     <div className="space-y-3 max-h-[600px] overflow-y-auto pr-1">
                         {deals.map((deal, idx) => (
-                            <DealCard key={deal.hotel_id || idx} deal={deal} rank={idx + 1} />
+                            <DealCard key={deal.hotel_id || idx} deal={deal} rank={idx + 1} extensionInstalled={extensionInstalled} />
                         ))}
                     </div>
+                </div>
+            );
+        }
+
+        function ExtensionBanner({ show, showInstructions, onToggleInstructions }) {
+            if (!show) return null;
+            return (
+                <div className="bg-gradient-to-r from-amber-50 to-yellow-50 border border-amber-200 rounded-xl p-4 mb-4">
+                    <div className="flex items-start justify-between gap-3">
+                        <div className="flex-1">
+                            <p className="text-sm font-semibold text-amber-800">
+                                ⚡ Book instantly — no remote browser needed
+                            </p>
+                            <p className="text-xs text-amber-700 mt-1">
+                                Install the GeoPrice Chrome Extension to book at geo-targeted prices directly from your browser.
+                            </p>
+                        </div>
+                        <a
+                            href="/extension/geoprice-extension.zip"
+                            download
+                            className="flex-shrink-0 bg-amber-500 hover:bg-amber-600 text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap"
+                        >
+                            Download ZIP
+                        </a>
+                    </div>
+                    <button
+                        onClick={onToggleInstructions}
+                        className="mt-2 text-xs text-amber-600 hover:text-amber-800 font-medium underline"
+                    >
+                        {showInstructions ? 'Hide instructions ▲' : 'How to install ▾'}
+                    </button>
+                    {showInstructions && (
+                        <ol className="mt-3 space-y-1.5 text-xs text-amber-800 list-decimal list-inside bg-white rounded-lg p-3 border border-amber-100">
+                            <li>Download the ZIP file above</li>
+                            <li>Unzip it to a folder on your computer</li>
+                            <li>Open Chrome and go to <code className="bg-amber-100 px-1 rounded">chrome://extensions</code></li>
+                            <li>Enable <strong>Developer Mode</strong> (toggle in the top-right)</li>
+                            <li>Click <strong>Load Unpacked</strong> and select the unzipped folder</li>
+                            <li>Reload this page — the banner will disappear when the extension is active</li>
+                        </ol>
+                    )}
                 </div>
             );
         }
@@ -366,21 +585,51 @@
             const [deals, setDeals] = useState([]);
             const [searching, setSearching] = useState(false);
             const [userCountry, setUserCountry] = useState('US');
+            const [extensionInstalled, setExtensionInstalled] = useState(false);
+            const [showInstallInstructions, setShowInstallInstructions] = useState(false);
             const messagesEndRef = useRef(null);
+            // Ref to track live deals order (avoids stale closure in merge function)
+            const dealsRef = useRef([]);
 
             useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
 
-            // Auto-detect user's country from IP for baseline comparison
-            // Only use the detected country if it's one of our 32 supported geos; otherwise keep US
+            // Detect Chrome extension after a short delay (content script sets the attribute)
             useEffect(() => {
-                fetch('https://ipapi.co/json/')
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.country_code && COUNTRY_FLAGS[data.country_code]) {
-                            setUserCountry(data.country_code);
-                        }
-                    })
-                    .catch(() => { /* silent fail — keep default US */ });
+                const timer = setTimeout(() => {
+                    const attr = document.documentElement.getAttribute('data-geoprice-ext');
+                    setExtensionInstalled(!!attr);
+                }, 300);
+                return () => clearTimeout(timer);
+            }, []);
+
+            // Merge incoming deals without reordering existing cards (prevents jumping).
+            // New hotels are appended at the bottom; existing ones update data in-place.
+            const mergeDeals = useCallback((incoming) => {
+                const prev = dealsRef.current;
+                if (prev.length === 0) {
+                    dealsRef.current = incoming;
+                    setDeals(incoming);
+                    return;
+                }
+                const prevMap = new Map(prev.map(d => [d.hotel_id, d]));
+                // Update existing cards in-place (same position)
+                const updated = prev.map(d => {
+                    const fresh = incoming.find(nd => nd.hotel_id === d.hotel_id);
+                    return fresh || d;
+                });
+                // Append genuinely new hotels at the bottom
+                for (const nd of incoming) {
+                    if (!prevMap.has(nd.hotel_id)) updated.push(nd);
+                }
+                dealsRef.current = updated;
+                setDeals(updated);
+            }, []);
+
+            // When search completes, sort by savings % and reset the ref
+            const handleSearchDone = useCallback(() => {
+                setSearching(false);
+                setDeals(prev => [...prev].sort((a, b) => (b.savings_percent || 0) - (a.savings_percent || 0)));
+                dealsRef.current = [];
             }, []);
 
             const sendMessage = async (text) => {
@@ -401,6 +650,7 @@
                     setMessages(prev => [...prev, { role: 'assistant', content: data.response, timestamp: new Date().toISOString() }]);
                     if (data.search_triggered && data.search_id) {
                         setSearchId(data.search_id);
+                        dealsRef.current = [];
                         setDeals([]);
                         setSearching(true);
                     }
@@ -412,6 +662,7 @@
 
             const newSearch = () => {
                 setMessages([{ role: 'assistant', content: "Hey! 👋 Where would you like to go next?", timestamp: new Date().toISOString() }]);
+                dealsRef.current = [];
                 setConversationId(null); setIntent({}); setSearchId(null); setDeals([]); setSearching(false);
             };
 
@@ -474,30 +725,28 @@
                             {/* Results panel — 3 cols */}
                             <div className="lg:col-span-3 space-y-4 overflow-y-auto" style={{ maxHeight: '80vh' }}>
                                 <IntentCard intent={intent} />
-                                {searchId && <SearchProgress searchId={searchId} onComplete={setDeals} onDone={() => setSearching(false)} />}
-                                {deals.length > 0 && <ResultsPanel deals={deals} searching={searching} />}
+                                {searchId && <SearchProgress searchId={searchId} onComplete={mergeDeals} onDone={handleSearchDone} />}
+                                {deals.length > 0 && !extensionInstalled && (
+                                    <ExtensionBanner
+                                        show={true}
+                                        showInstructions={showInstallInstructions}
+                                        onToggleInstructions={() => setShowInstallInstructions(p => !p)}
+                                    />
+                                )}
+                                {deals.length > 0 && <ResultsPanel deals={deals} searching={searching} extensionInstalled={extensionInstalled} />}
                                 {!searchId && deals.length === 0 && (
-                                    <div className="bg-white rounded-2xl p-8 text-center border border-gray-100 shadow-sm">
-                                        <div className="text-4xl mb-3">🔍</div>
-                                        <h3 className="font-semibold text-gray-700 mb-2">How it works</h3>
-                                        <p className="text-sm text-gray-500 mb-4">Tell me your destination and travel dates. I'll check Booking.com prices from 32 countries and show you where the same hotel is cheapest.</p>
-                                        <div className="grid grid-cols-3 gap-3 text-xs text-gray-500">
-                                            <div className="bg-indigo-50 rounded-lg p-3">
-                                                <div className="text-2xl mb-1">💬</div>
-                                                <p className="font-medium text-gray-700">Chat</p>
-                                                <p>Tell me where & when</p>
-                                            </div>
-                                            <div className="bg-purple-50 rounded-lg p-3">
-                                                <div className="text-2xl mb-1">🌍</div>
-                                                <p className="font-medium text-gray-700">Search</p>
-                                                <p>32 countries checked</p>
-                                            </div>
-                                            <div className="bg-green-50 rounded-lg p-3">
-                                                <div className="text-2xl mb-1">💰</div>
-                                                <p className="font-medium text-gray-700">Save</p>
-                                                <p>Up to 40% cheaper</p>
-                                            </div>
-                                        </div>
+                                    <div className="space-y-4">
+                                        {!extensionInstalled && (
+                                            <ExtensionBanner
+                                                show={true}
+                                                showInstructions={showInstallInstructions}
+                                                onToggleInstructions={() => setShowInstallInstructions(p => !p)}
+                                            />
+                                        )}
+                                        <FeaturedDeals
+                                            onStartSearch={() => document.querySelector('input[placeholder]')?.focus()}
+                                            extensionInstalled={extensionInstalled}
+                                        />
                                     </div>
                                 )}
                             </div>

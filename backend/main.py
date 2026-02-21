@@ -3,7 +3,7 @@ GeoPrice Travel - Backend API
 Chat interface + Price search engine
 """
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
@@ -40,62 +40,29 @@ conversations: Dict[str, dict] = {}
 searches: Dict[str, dict] = {}
 proxy_tokens: Dict[str, dict] = {}  # token → { geo_code, proxy_addr, expires_at }
 
-# Browser session pool — ports 16080-16099 (20 slots, POOL_SIZE pre-warmed)
-BROWSER_PORTS = list(range(16080, 16100))
-POOL_SIZE = 5  # containers kept warm and ready at all times
-browser_sessions: Dict[str, dict] = {}
-slot_containers: Dict[int, str] = {}   # slot_index -> container_name
-slot_status: Dict[int, str] = {}       # "warming" | "warm" | "active" | "free"
-warm_queue: asyncio.Queue = asyncio.Queue()  # slot indices ready to hand out
+# Neko WebRTC remote browser sessions (on-demand, no pool)
+# HTTP signaling ports: 17080-17099  (20 concurrent sessions max)
+# WebRTC EPR per slot: 59000+slot*100 … 59099+slot*100  (100 ports each, firewall open 59000-59100)
+NEKO_HTTP_PORT_MIN = 17080
+NEKO_HTTP_PORT_MAX = 17099
+NEKO_EPR_BASE = 59000
+NEKO_EPR_PER_SLOT = 100
+neko_sessions: Dict[str, dict] = {}  # session_id -> {http_port, container_name, ...}
 
 # Services
 chat_service = ChatService()
 price_engine = PriceEngine()
 
 
-# ============== Browser Pool ==============
+# ============== Neko Session Helpers ==============
 
-async def _start_warm_slot(slot_index: int):
-    """Start a warm (idle, about:blank) browser container at the given slot."""
-    import httpx
-    port = BROWSER_PORTS[slot_index]
-    container_name = f"browse_warm_{slot_index}"
-    slot_status[slot_index] = "warming"
-    slot_containers[slot_index] = container_name
-
-    # Remove any existing container at this slot
-    subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, timeout=10)
-
-    cmd = [
-        "docker", "run", "-d", "--rm",
-        "--name", container_name,
-        "-p", f"127.0.0.1:{port}:6080",
-        "-e", "START_URL=about:blank",
-        "--memory=512m", "--cpus=0.5",
-        "geoprice-browser"
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            slot_status[slot_index] = "free"
-            return
-    except Exception:
-        slot_status[slot_index] = "free"
-        return
-
-    # Wait for websockify to serve HTTP (up to 30s)
-    async with httpx.AsyncClient() as client:
-        for _ in range(60):
-            await asyncio.sleep(0.5)
-            try:
-                resp = await client.get(f"http://127.0.0.1:{port}/vnc.html", timeout=2.0)
-                if resp.status_code == 200:
-                    break
-            except Exception:
-                continue
-
-    slot_status[slot_index] = "warm"
-    await warm_queue.put(slot_index)
+def _pick_neko_port() -> int:
+    """Pick a free HTTP port in the neko pool."""
+    used = {s["http_port"] for s in neko_sessions.values()}
+    for port in range(NEKO_HTTP_PORT_MIN, NEKO_HTTP_PORT_MAX + 1):
+        if port not in used:
+            return port
+    raise RuntimeError("All neko session ports are in use")
 
 
 # ============== CONNECT Relay Proxy ==============
@@ -147,47 +114,44 @@ async def _proxy_pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
 
 
 async def _proxy_handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Handle one browser connection to the CONNECT relay proxy on port 8766."""
+    """
+    Handle one browser connection to the geo proxy on port 8766.
+    Supports both CONNECT (HTTPS tunneling) and plain HTTP GET/POST.
+    The extension's onAuthRequired handler provides the token as Basic auth username.
+    """
     import base64
+
+    _407 = (
+        b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+        b"Proxy-Authenticate: Basic realm=\"GeoPrice\"\r\n"
+        b"Content-Length: 0\r\n"
+        b"Proxy-Connection: keep-alive\r\n"
+        b"\r\n"
+    )
 
     geo_writer = None
     try:
         method, target, headers = await _proxy_read_request(reader)
-
-        if method != "CONNECT":
-            writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
-            await writer.drain()
+        if not method:
             return
 
         proxy_auth = headers.get("proxy-authorization", "")
 
         if not proxy_auth:
-            # Challenge the browser — Chrome will fire onAuthRequired in the extension
-            writer.write(
-                b"HTTP/1.1 407 Proxy Authentication Required\r\n"
-                b"Proxy-Authenticate: Basic realm=\"GeoPrice\"\r\n"
-                b"Content-Length: 0\r\n"
-                b"Proxy-Connection: keep-alive\r\n"
-                b"\r\n"
-            )
+            # Challenge — Chrome fires onAuthRequired in the extension background.js
+            writer.write(_407)
             await writer.drain()
-            # Browser retries on the same connection with credentials
+            # Read the retry (Chrome resends the same request with credentials)
             try:
-                method2, target2, headers2 = await asyncio.wait_for(
+                method, target, headers = await asyncio.wait_for(
                     _proxy_read_request(reader), timeout=15
                 )
-                if method2 == "CONNECT":
-                    target, headers = target2, headers2
-                    proxy_auth = headers2.get("proxy-authorization", "")
+                proxy_auth = headers.get("proxy-authorization", "")
             except asyncio.TimeoutError:
                 return
 
         if not proxy_auth or not proxy_auth.lower().startswith("basic "):
-            writer.write(
-                b"HTTP/1.1 407 Proxy Authentication Required\r\n"
-                b"Proxy-Authenticate: Basic realm=\"GeoPrice\"\r\n"
-                b"Content-Length: 0\r\n\r\n"
-            )
+            writer.write(_407)
             await writer.drain()
             return
 
@@ -196,14 +160,14 @@ async def _proxy_handle_client(reader: asyncio.StreamReader, writer: asyncio.Str
             creds = base64.b64decode(proxy_auth[6:]).decode("utf-8", errors="replace")
             token = creds.split(":")[0]
         except Exception:
-            writer.write(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"GeoPrice\"\r\nContent-Length: 0\r\n\r\n")
+            writer.write(_407)
             await writer.drain()
             return
 
         # Validate token
         entry = proxy_tokens.get(token)
         if not entry or datetime.utcnow() > entry["expires_at"]:
-            writer.write(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"GeoPrice\"\r\nContent-Length: 0\r\n\r\n")
+            writer.write(_407)
             await writer.drain()
             return
 
@@ -211,7 +175,7 @@ async def _proxy_handle_client(reader: asyncio.StreamReader, writer: asyncio.Str
         proxy_host, proxy_port_str = proxy_addr.rsplit(":", 1)
         proxy_port = int(proxy_port_str)
 
-        # Connect to the geo proxy
+        # Connect to the upstream geo proxy
         try:
             geo_reader, geo_writer = await asyncio.wait_for(
                 asyncio.open_connection(proxy_host, proxy_port), timeout=15
@@ -222,32 +186,43 @@ async def _proxy_handle_client(reader: asyncio.StreamReader, writer: asyncio.Str
             await writer.drain()
             return
 
-        # Forward CONNECT to geo proxy (it's an HTTP proxy that supports CONNECT)
-        geo_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
-        await geo_writer.drain()
+        if method == "CONNECT":
+            # HTTPS tunnel: forward CONNECT to geo proxy
+            geo_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+            await geo_writer.drain()
 
-        # Read geo proxy's response to our CONNECT
-        try:
-            geo_status = await asyncio.wait_for(geo_reader.readline(), timeout=15)
-            # drain remaining headers
-            while True:
-                line = await asyncio.wait_for(geo_reader.readline(), timeout=5)
-                if line in (b"\r\n", b"\n", b""):
-                    break
-        except asyncio.TimeoutError:
-            writer.write(b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
+            # Read geo proxy's CONNECT response
+            try:
+                geo_status = await asyncio.wait_for(geo_reader.readline(), timeout=15)
+                while True:
+                    line = await asyncio.wait_for(geo_reader.readline(), timeout=5)
+                    if line in (b"\r\n", b"\n", b""):
+                        break
+            except asyncio.TimeoutError:
+                writer.write(b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                return
+
+            if b"200" not in geo_status:
+                print(f"[Relay] Geo proxy refused CONNECT to {target}: {geo_status.strip()}")
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                return
+
+            writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
             await writer.drain()
-            return
 
-        if b"200" not in geo_status:
-            print(f"[Relay] Geo proxy refused CONNECT to {target}: {geo_status.strip()}")
-            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-            await writer.drain()
-            return
-
-        # Tell the browser the tunnel is open
-        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        await writer.drain()
+        else:
+            # Plain HTTP (GET/POST/etc): forward full request to geo proxy
+            req = f"{method} {target} HTTP/1.1\r\n"
+            # Strip proxy-specific headers before forwarding
+            fwd_headers = {k: v for k, v in headers.items()
+                           if k.lower() not in ("proxy-authorization", "proxy-connection")}
+            fwd_headers.setdefault("connection", "close")
+            req += "".join(f"{k}: {v}\r\n" for k, v in fwd_headers.items())
+            req += "\r\n"
+            geo_writer.write(req.encode())
+            await geo_writer.drain()
 
         # Bidirectional pipe until either side closes
         await asyncio.gather(
@@ -284,19 +259,17 @@ async def _start_connect_proxy():
 
 
 @app.on_event("startup")
-async def startup_browser_pool():
-    """Stop leftover containers from previous runs, then pre-warm the pool."""
+async def on_startup():
+    """Clean up leftover neko containers from previous runs and start relay proxy."""
     try:
         ps = subprocess.run(
-            ["docker", "ps", "-q", "--filter", "ancestor=geoprice-browser"],
+            ["docker", "ps", "-q", "--filter", "name=geoprice-neko-"],
             capture_output=True, text=True, timeout=10
         )
         for cid in ps.stdout.split():
             subprocess.run(["docker", "stop", cid], capture_output=True, timeout=10)
     except Exception:
         pass
-    for i in range(POOL_SIZE):
-        asyncio.create_task(_start_warm_slot(i))
     asyncio.create_task(_start_connect_proxy())
 
 
@@ -402,7 +375,8 @@ async def download_extension():
     zip_path = Path(__file__).parent.parent / "extension" / "geoprice-extension.zip"
     if not zip_path.exists():
         raise HTTPException(status_code=404, detail="Extension zip not found")
-    return FileResponse(zip_path, media_type="application/zip", filename="geoprice-extension.zip")
+    return FileResponse(zip_path, media_type="application/zip", filename="geoprice-extension.zip",
+                        headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 
 @app.get("/api/health")
@@ -621,19 +595,199 @@ def _build_proxy_url_for_geo(geo_code: str) -> str:
     return proxy_base_url
 
 
+# Port pool for per-token no-auth relay servers (8770–8869 = 100 slots)
+_TOKEN_PORT_MIN = 8770
+_TOKEN_PORT_MAX = 8869
+_active_relay_servers: Dict[str, asyncio.AbstractServer] = {}  # token → server
+
+
+_BOOKING_HOST_RE = re.compile(r'^(www\.)?booking\.com$', re.IGNORECASE)
+
+
+async def _relay_noauth_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    proxy_host: str,
+    proxy_port: int,
+    allowed_ip: str,
+    restrict_hosts: bool = True,
+):
+    """
+    No-auth CONNECT relay: forwards to a fixed upstream geo proxy.
+    Security guards:
+      1. Only accepts connections from the IP that created the token.
+      2. (optional) Only tunnels to *.booking.com — for the extension relay.
+         Neko relay sets restrict_hosts=False so the full browser can load
+         all page assets (CDN, fonts, images on bstatic.com, etc.)
+    """
+    client_ip = writer.get_extra_info("peername", ("?", 0))[0]
+    geo_writer = None
+    try:
+        # Guard 1: IP allowlist — only enforced for neko relay (allowed_ip="127.0.0.1").
+        # Extension relay skips this: port-per-token + host allowlist (Guard 2) is sufficient.
+        if allowed_ip == "127.0.0.1" and client_ip != allowed_ip:
+            print(f"[Relay/noauth] Rejected connection from {client_ip} (expected {allowed_ip})")
+            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            return
+
+        method, target, headers = await _proxy_read_request(reader)
+        if method != "CONNECT":
+            # Plain HTTP proxy request (e.g. GET http://ip-api.com/json HTTP/1.1)
+            # Forward to the geo proxy as-is.
+            try:
+                geo_reader, geo_writer = await asyncio.wait_for(
+                    asyncio.open_connection(proxy_host, proxy_port), timeout=15
+                )
+            except Exception as e:
+                writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                return
+            # Reconstruct and forward the request
+            req  = f"{method} {target} HTTP/1.1\r\n"
+            req += "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+            req += "\r\n"
+            geo_writer.write(req.encode())
+            await geo_writer.drain()
+            await asyncio.gather(
+                _proxy_pipe(reader, geo_writer),
+                _proxy_pipe(geo_reader, writer),
+                return_exceptions=True,
+            )
+            return
+
+        # Guard 2 (extension relay only): target must be *.booking.com or ip-api.com
+        if restrict_hosts:
+            # For CONNECT the target is host:port; for plain HTTP it's http://host/path
+            target_host = target.split(":")[0]
+            if target_host.startswith("http://") or target_host.startswith("https://"):
+                from urllib.parse import urlparse as _urlparse
+                target_host = _urlparse(target).hostname or ""
+            allowed = (
+                _BOOKING_HOST_RE.match(target_host)
+                or target_host.endswith(".booking.com")
+                or target_host in ("ip-api.com", "www.ip-api.com")
+            )
+            if not allowed:
+                print(f"[Relay/noauth] Blocked request to non-allowed host: {target}")
+                writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                return
+
+        # Connect to the geo proxy
+        try:
+            geo_reader, geo_writer = await asyncio.wait_for(
+                asyncio.open_connection(proxy_host, proxy_port), timeout=15
+            )
+        except Exception as e:
+            print(f"[Relay/noauth] Cannot reach geo proxy {proxy_host}:{proxy_port}: {e}")
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            return
+
+        # Forward CONNECT to the geo proxy
+        geo_writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+        await geo_writer.drain()
+
+        # Read geo proxy's response
+        try:
+            geo_status = await asyncio.wait_for(geo_reader.readline(), timeout=15)
+            while True:
+                line = await asyncio.wait_for(geo_reader.readline(), timeout=5)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+        except asyncio.TimeoutError:
+            writer.write(b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            return
+
+        if b"200" not in geo_status:
+            writer.write(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            return
+
+        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        await writer.drain()
+
+        await asyncio.gather(
+            _proxy_pipe(reader, geo_writer),
+            _proxy_pipe(geo_reader, writer),
+            return_exceptions=True,
+        )
+
+    except Exception as e:
+        print(f"[Relay/noauth] Error: {e}")
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+        if geo_writer:
+            try:
+                geo_writer.close()
+            except Exception:
+                pass
+
+
+def _pick_relay_port() -> int:
+    """Pick a free port in the per-token pool (8770–8869).
+
+    Checks both our in-memory tracking dicts AND does an actual OS-level
+    socket bind test so stale relay servers from expired sessions don't
+    block the port from being reused.
+    """
+    import socket as _socket
+    used = {v.get("relay_port") for v in proxy_tokens.values() if v.get("relay_port")}
+    used |= {s.get("relay_port") for s in neko_sessions.values() if s.get("relay_port")}
+    for port in range(_TOKEN_PORT_MIN, _TOKEN_PORT_MAX + 1):
+        if port in used:
+            continue
+        # Verify at OS level — stale server processes may still hold the socket
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError("All relay ports in use")
+
+
 @app.post("/api/proxy-token")
-async def create_proxy_token(request: ProxyTokenRequest):
-    """Issue a short-lived token that the Chrome extension exchanges for a PAC script."""
+async def create_proxy_token(request: ProxyTokenRequest, http_request: Request):
+    """
+    Issue a short-lived token that the Chrome extension exchanges for a PAC script.
+    Starts a dedicated no-auth relay on a per-token port — Chrome never sees a 407
+    challenge, so no native credential dialog appears.
+    The relay only accepts connections from the same IP that called this endpoint.
+    """
     geo = request.geo_country.upper()
     proxy_addr = PriceEngine.GEO_PROXIES.get(geo)
     if not geo or not proxy_addr:
         raise HTTPException(status_code=400, detail="Unsupported geo or no proxy available")
+
+    # Capture the real client IP (X-Forwarded-For set by nginx, fallback to direct)
+    forwarded = http_request.headers.get("X-Forwarded-For", "")
+    allowed_ip = forwarded.split(",")[0].strip() if forwarded else (http_request.client.host if http_request.client else "")
+    if not allowed_ip:
+        raise HTTPException(status_code=400, detail="Cannot determine client IP")
+
     token = secrets.token_urlsafe(32)
     proxy_tokens[token] = {
         "geo_code": geo,
         "proxy_addr": proxy_addr,
+        "allowed_ip": allowed_ip,
         "expires_at": datetime.utcnow() + timedelta(minutes=30),
     }
+    print(f"[Relay] Token issued for {geo} → {proxy_addr} (client={allowed_ip})")
+
+    # Auto-expire token
+    async def _expire():
+        await asyncio.sleep(1800)
+        proxy_tokens.pop(token, None)
+
+    asyncio.create_task(_expire())
+
     return {"token": token, "ttl": 1800}
 
 
@@ -644,143 +798,290 @@ async def get_pac_script(token: str):
     if not entry or datetime.utcnow() > entry["expires_at"]:
         raise HTTPException(status_code=404, detail="Invalid or expired token")
     relay_host = os.getenv("PROXY_RELAY_HOST", "hotels.chatleg.ai")
-    relay_port = int(os.getenv("PROXY_RELAY_PORT", "8766"))
+    # All extension proxy traffic goes through port 8766 (authenticated CONNECT+HTTP proxy).
+    # Chrome's onAuthRequired handler in background.js supplies the token as Basic auth.
     pac = (
         f'function FindProxyForURL(url, host) {{\n'
-        f'  if (shExpMatch(host, "*.booking.com") || host === "booking.com") {{\n'
-        f'    return "PROXY {relay_host}:{relay_port}";\n'
+        f'  if (shExpMatch(host, "*.booking.com") || host === "booking.com"\n'
+        f'      || host === "ip-api.com" || host === "www.ip-api.com") {{\n'
+        f'    return "PROXY {relay_host}:8766";\n'
         f'  }}\n'
         f'  return "DIRECT";\n'
         f'}}'
     )
-    return {"pac": pac, "geo": entry["geo_code"]}
+    geo_code = entry["geo_code"]
+    geo_info = PriceEngine.GEO_COUNTRIES.get(geo_code, {})
+    geo_name = geo_info.get("name", geo_code)
+    return {"pac": pac, "geo": geo_code, "geo_name": geo_name}
+
+
+from fastapi.responses import Response as _Response
+
+@app.get("/api/pac-js/{token}")
+async def get_pac_js(token: str):
+    """Return raw PAC JavaScript (not JSON) — used by pacScript.url in the extension."""
+    entry = proxy_tokens.get(token)
+    if not entry or datetime.utcnow() > entry["expires_at"]:
+        raise HTTPException(status_code=404, detail="Invalid or expired token")
+    relay_host = os.getenv("PROXY_RELAY_HOST", "hotels.chatleg.ai")
+    pac = (
+        f'function FindProxyForURL(url, host) {{\n'
+        f'  if (shExpMatch(host, "*.booking.com") || host === "booking.com" ||\n'
+        f'      host === "ip-api.com" || host === "www.ip-api.com") {{\n'
+        f'    return "PROXY {relay_host}:8766";\n'
+        f'  }}\n'
+        f'  return "DIRECT";\n'
+        f'}}\n'
+    )
+    return _Response(content=pac, media_type="application/x-ns-proxy-autoconfig")
 
 
 @app.post("/api/browse")
 async def browse(request: BrowseRequest):
     """
-    Route user to a pre-warmed geo-targeted remote browser (Docker + noVNC).
-    Returns a session URL pointing to the noVNC web UI through nginx.
+    Spin up a Neko WebRTC remote browser session geo-targeted to the requested country.
+    Uses our existing per-token relay proxy so the neko container (--network host) can
+    reach the geo proxy without auth dialogs.
+    Returns the session URL, a one-time password, and session_id.
     """
-    try:
-        slot_index = warm_queue.get_nowait()
-    except asyncio.QueueEmpty:
-        raise HTTPException(
-            status_code=503,
-            detail="No browser sessions available right now. Please try again in a moment."
-        )
-
-    container_name = slot_containers[slot_index]
-    port = BROWSER_PORTS[slot_index]
-    proxy_url = _build_proxy_url_for_geo(request.country)
-
-    # Build proxy args for Chromium.
-    # Direct proxies (no auth): pass --proxy-server directly.
-    # Auth proxies: start a local relay inside the container (Chromium ignores
-    # credentials embedded in the proxy URL).
-    relay_cmd = ""
-    proxy_arg = ""
-    if proxy_url:
-        m = re.match(r'https?://([^:]+):([^@]+)@(.+)', proxy_url)
-        if m:
-            # Auth proxy — use relay
-            user, password, hostport = m.groups()
-            relay_cmd = (
-                f"pkill -f proxy-relay.py 2>/dev/null || true; "
-                f"python3 /usr/local/bin/proxy-relay.py 18080 {hostport} {user}:{password} & "
-                "sleep 0.5; "
-            )
-            proxy_arg = "--proxy-server=http://127.0.0.1:18080"
-        else:
-            # No-auth direct proxy — pass URL straight to Chromium
-            proxy_arg = f"--proxy-server={proxy_url}"
-
-    # Use the geo's local currency so Booking.com applies the correct pricing tier.
-    # Forcing USD here causes Booking.com to show US-tier prices, wiping out the discount.
     from price_engine import PriceEngine
+
+    geo = request.country.upper()
+    geo_info = PriceEngine.GEO_COUNTRIES.get(geo, {})
+
+    # ── 1. Pick neko HTTP port ────────────────────────────────────────────────
+    try:
+        neko_port = _pick_neko_port()
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="All browser sessions are busy. Try again shortly.")
+
+    slot_idx = neko_port - NEKO_HTTP_PORT_MIN
+    epr_min = NEKO_EPR_BASE + slot_idx * NEKO_EPR_PER_SLOT
+    epr_max = epr_min + NEKO_EPR_PER_SLOT - 1
+
+    # ── 2. Start an internal relay for the geo proxy (--network host means
+    #      containers access host via 127.0.0.1) ──────────────────────────────
+    relay_port = None
+    relay_srv = None
+    proxy_addr = PriceEngine.GEO_PROXIES.get(geo)
+
+    if proxy_addr:
+        try:
+            relay_port = _pick_relay_port()
+        except RuntimeError:
+            raise HTTPException(status_code=503, detail="No relay ports available, try again shortly")
+
+        proxy_host, proxy_port_str = proxy_addr.rsplit(":", 1)
+        proxy_port_int = int(proxy_port_str)
+
+        relay_srv = await asyncio.start_server(
+            lambda r, w: _relay_noauth_client(r, w, proxy_host, proxy_port_int, "127.0.0.1", restrict_hosts=False),
+            "0.0.0.0", relay_port,
+        )
+        asyncio.create_task(relay_srv.serve_forever())
+        print(f"[Neko] Internal relay port {relay_port} → {proxy_addr} (geo={geo})")
+
+    # ── 3. Append geo currency + language to Booking.com URL ─────────────────
     url = request.url
-    if 'booking.com' in url:
-        sep = '&' if '?' in url else '?'
-        if 'selected_currency=' not in url:
-            geo_currency = PriceEngine.GEO_COUNTRIES.get(request.country, {}).get("currency", "USD")
-            url += f'{sep}selected_currency={geo_currency}'
-            sep = '&'
-        if 'lang=' not in url:
-            url += f'{sep}lang=en-us'
+    if "booking.com" in url:
+        sep = "&" if "?" in url else "?"
+        if "selected_currency=" not in url:
+            geo_currency = geo_info.get("currency", "USD")
+            url += f"{sep}selected_currency={geo_currency}"
+            sep = "&"
+        if "lang=" not in url:
+            url += f"{sep}lang=en-us"
 
-    safe_url = url.replace("'", "%27")
+    # ── 4. Build env vars for our chromium-wrapper.sh ────────────────────────
+    # NEKO_PROXY_FLAG: single --proxy-server flag (empty string = no proxy)
+    # NEKO_START_URL:  URL to open (passed as last arg to chromium)
+    proxy_flag = f"--proxy-server=http://127.0.0.1:{relay_port}" if relay_port else ""
 
-    # Kill all chromium processes inside the container.
-    # pkill is not available in this image, so we use Python (which is present).
-    # Match only the binary path (first null-delimited arg) to avoid killing
-    # our own bash/python process that mentions "chromium" in its arguments.
-    kill_chromium = (
-        "python3 -c \""
-        "import os,glob\n"
-        "for f in glob.glob('/proc/*/cmdline'):\n"
-        " try:\n"
-        "  args=open(f,'rb').read().split(b'\\x00')\n"
-        "  if args and b'chromium' in args[0]:\n"
-        "   os.kill(int(f.split('/')[2]),9)\n"
-        " except: pass\n"
-        "\" 2>/dev/null; sleep 1; "
-    )
-
-    nav_script = (
-        relay_cmd +
-        kill_chromium +
-        f"DISPLAY=:1 /usr/bin/chromium "
-        "--no-sandbox --disable-dev-shm-usage --disable-gpu "
-        "--disable-blink-features=AutomationControlled "
-        "--window-size=1280,900 --start-maximized "
-        "--no-first-run --disable-infobars "
-        "--user-data-dir=/tmp/chrome-geo-session "
-        f"--ignore-certificate-errors {proxy_arg} '{safe_url}' &"
-    )
-    result = subprocess.run(
-        ["docker", "exec", "-d", container_name, "bash", "-c", nav_script],
-        capture_output=True, timeout=10, text=True
-    )
-    if result.returncode != 0:
-        print(f"[browse] docker exec failed (rc={result.returncode}): {result.stderr[:200]}")
-
+    # ── 5. Launch neko container ──────────────────────────────────────────────
     session_id = secrets.token_hex(8)
-    slot_status[slot_index] = "active"
-    browser_sessions[session_id] = {
-        "port": port,
-        "slot": slot_index,
+    container_name = f"geoprice-neko-{session_id}"
+    neko_password = secrets.token_urlsafe(6)
+    public_host = os.getenv("SERVER_PUBLIC_IP", "hotels.chatleg.ai")
+    # NEKO_NAT1TO1 must be a raw IP — resolve hostname if needed
+    import socket as _sock
+    try:
+        public_ip = _sock.gethostbyname(public_host)
+    except Exception:
+        public_ip = public_host
+
+    cmd = [
+        "docker", "run", "-d", "--rm",
+        "--network", "host",
+        "--name", container_name,
+        "--memory=1g", "--cpus=1.0",
+        "--shm-size=2g",              # Chromium needs shared memory
+        "-e", f"NEKO_BIND=:{neko_port}",
+        "-e", f"NEKO_EPR={epr_min}:{epr_max}",
+        "-e", f"NEKO_NAT1TO1={public_ip}",  # must be IP, not hostname
+        "-e", "NEKO_ICELITE=1",
+        "-e", f"NEKO_PASSWORD={neko_password}",
+        "-e", "NEKO_PASSWORD_ADMIN=admin",
+        "-e", "NEKO_SCREEN=1280x720@30",
+        "-e", f"NEKO_PROXY_FLAG={proxy_flag}",
+        "-e", f"NEKO_START_URL={url}",
+        os.getenv("NEKO_IMAGE", "geoprice-neko"),
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            # Clean up relay if container failed to start
+            if relay_srv:
+                relay_srv.close()
+            raise HTTPException(status_code=500,
+                detail=f"Failed to start browser session: {result.stderr[:200]}")
+    except subprocess.TimeoutExpired:
+        if relay_srv:
+            relay_srv.close()
+        raise HTTPException(status_code=504, detail="Timeout launching browser session")
+
+    neko_sessions[session_id] = {
+        "http_port": neko_port,
         "container_name": container_name,
-        "country": request.country,
-        "url": request.url,
+        "country": geo,
+        "password": neko_password,
+        "relay_port": relay_port,
+        "relay_srv": relay_srv,
         "started_at": datetime.utcnow().isoformat(),
     }
 
-    # Schedule cleanup and pool replenishment after 30 minutes
-    asyncio.create_task(_cleanup_and_replenish(session_id, slot_index, delay=1800))
+    # Schedule cleanup after 30 minutes
+    asyncio.create_task(_cleanup_neko_session(session_id, delay=1800))
 
-    # Fix: pass path so noVNC WebSocket connects through the right nginx location
-    session_url = (
-        f"/browse/s{slot_index}/vnc.html"
-        f"?autoconnect=true&resize=scale&path=browse/s{slot_index}/"
-    )
+    # ── Wait for neko HTTP port to be listening ───────────────────────────────
+    # docker run returns immediately but neko takes ~3-8 s to bind its port.
+    # If we return the URL before neko is ready the browser gets ERR_CONNECTION_REFUSED.
+    neko_ready = False
+    for _ in range(30):  # up to 15 seconds (30 × 0.5 s)
+        try:
+            r, w = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", neko_port), timeout=1
+            )
+            w.close()
+            await w.wait_closed()
+            neko_ready = True
+            break
+        except Exception:
+            await asyncio.sleep(0.5)
+
+    if not neko_ready:
+        print(f"[Neko] Warning: port {neko_port} not ready after 15 s — returning URL anyway")
+
+    # Give neko's HTTP server an extra moment to finish initialising
+    await asyncio.sleep(0.5)
+
+    # neko v2 auto-connects when BOTH ?pwd= AND ?usr= are in the URL.
+    # No login form shown — goes directly to the remote browser.
+    session_url = f"http://{public_host}:{neko_port}/?pwd={neko_password}&usr=Viewer"
+    ws_url = f"ws://{public_host}:{neko_port}/ws"
     return {
         "session_url": session_url,
+        "ws_url": ws_url,
         "session_id": session_id,
-        "expires_in": 1800
+        "password": neko_password,
+        "expires_in": 1800,
+        "type": "neko_webrtc",
     }
 
 
-async def _cleanup_and_replenish(session_id: str, slot_index: int, delay: int = 1800):
-    """Stop the used browser container after delay, then warm a fresh one at that slot."""
+async def _cleanup_neko_session(session_id: str, delay: int = 1800):
+    """Stop the neko container and relay after delay seconds."""
     await asyncio.sleep(delay)
-    browser_sessions.pop(session_id, None)
-    container_name = slot_containers.get(slot_index, "")
+    session = neko_sessions.pop(session_id, {})
+    container = session.get("container_name")
+    if container:
+        try:
+            subprocess.run(["docker", "stop", container], capture_output=True, timeout=15)
+        except Exception:
+            pass
+    relay_srv = session.get("relay_srv")
+    if relay_srv:
+        try:
+            relay_srv.close()
+            await relay_srv.wait_closed()
+        except Exception:
+            pass
+    relay_port = session.get("relay_port")
+    if relay_port:
+        print(f"[Neko] Cleaned up session {session_id}, relay port {relay_port} freed")
+
+
+# ============== Featured Deals (from deal_scanner) ==============
+
+@app.get("/api/featured-deals")
+async def get_featured_deals(limit: int = 20, city: Optional[str] = None):
+    """
+    Return pre-scanned best deals (all cities or filtered by ?city=Paris).
+    Populated by deal_scanner.py running in the background (local or remote).
+    Returns empty list if scanner hasn't run yet.
+    """
+    db_path = os.getenv("DEAL_SCANNER_DB", "/tmp/geoprice_deals.db")
+    if not Path(db_path).exists():
+        return {"deals": [], "cities": [], "message": "Scanner warming up"}
     try:
-        subprocess.run(["docker", "stop", container_name], timeout=10, capture_output=True)
+        from deal_scanner import get_featured_deals as _get_deals, get_scanner_stats as _get_stats
+        deals = _get_deals(db_path, limit=limit, city=city)
+        stats = _get_stats(db_path)
+        return {"deals": deals, "cities": stats.get("cities", []), "stats": stats}
+    except Exception as e:
+        return {"deals": [], "cities": [], "error": str(e)}
+
+
+@app.post("/api/scanner/ingest")
+async def scanner_ingest(request: Request):
+    """
+    Receive deals from a remote scanner instance and store them in the local DB.
+    Protected by bearer token (SCANNER_INGEST_TOKEN in .env).
+    Payload: { city, check_in, check_out, tier, deals: [...] }
+    """
+    ingest_token = os.getenv("SCANNER_INGEST_TOKEN", "")
+    if not ingest_token:
+        raise HTTPException(status_code=503, detail="Ingest not configured on this server")
+
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer ") or auth[7:] != ingest_token:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    try:
+        body = await request.json()
     except Exception:
-        pass
-    slot_status[slot_index] = "free"
-    asyncio.create_task(_start_warm_slot(slot_index))
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    city = body.get("city", "")
+    check_in_str = body.get("check_in", "")
+    check_out_str = body.get("check_out", "")
+    tier = body.get("tier", "")
+    deals = body.get("deals", [])
+
+    if not all([city, check_in_str, check_out_str, tier]):
+        raise HTTPException(status_code=400, detail="Missing required fields: city, check_in, check_out, tier")
+
+    from datetime import date as _date
+    try:
+        check_in = _date.fromisoformat(check_in_str)
+        check_out = _date.fromisoformat(check_out_str)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format (use YYYY-MM-DD)")
+
+    db_path = os.getenv("DEAL_SCANNER_DB", "/tmp/geoprice_deals.db")
+    from deal_scanner import init_db as _init_db, save_deals as _save_deals
+    _init_db(db_path)
+    _save_deals(db_path, city, check_in, check_out, tier, deals, 0)
+
+    return {"ok": True, "stored": len(deals), "city": city}
+
+
+@app.get("/api/neko-sessions")
+async def neko_sessions_status():
+    """Return active neko session count and available slots."""
+    active = len(neko_sessions)
+    total = NEKO_HTTP_PORT_MAX - NEKO_HTTP_PORT_MIN + 1
+    return {"active": active, "available": total - active, "total": total}
 
 
 # ============== Health Check ==============
