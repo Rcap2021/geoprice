@@ -223,11 +223,14 @@
                 }, 600);
             }, []);
 
-            // What to display
+            // What to display: search results when available, otherwise city-filtered allDeals
             const filtered = React.useMemo(() => {
-                if (searchDeals !== null) return searchDeals;
+                if (query.trim()) {
+                    // While searching or after search — only show search results, never allDeals
+                    return searchDeals || [];
+                }
                 return activeCity === 'All' ? allDeals : allDeals.filter(d => d.city === activeCity);
-            }, [allDeals, searchDeals, activeCity]);
+            }, [allDeals, searchDeals, activeCity, query]);
 
             const deals = allDeals; // keep alias for stats display
 
@@ -323,30 +326,38 @@
                         </div>
                     )}
 
-                    {/* Result count when searching */}
-                    {query.trim() && !searching && (
+                    {/* Result count — only shown after search completes */}
+                    {query.trim() && !searching && searchDeals !== null && (
                         <p className="text-xs text-gray-400 mb-2">
                             {filtered.length === 0
                                 ? 'No deals match — try a different search'
                                 : `${filtered.length} deal${filtered.length !== 1 ? 's' : ''} found`}
                         </p>
                     )}
-                    {query.trim() && searching && (
-                        <p className="text-xs text-indigo-400 mb-2 animate-pulse">Searching with AI…</p>
-                    )}
 
-                    {/* Deal cards */}
-                    <div className="space-y-3">
-                        {filtered.map((deal, idx) => (
-                            <DealCard
-                                key={`${deal.hotel_id}-${deal.check_in}`}
-                                deal={deal}
-                                rank={idx + 1}
-                                extensionInstalled={extensionInstalled}
-                                showDates={true}
-                            />
-                        ))}
-                    </div>
+                    {/* Deal cards — hide while searching, show spinner instead */}
+                    {query.trim() && searching ? (
+                        <div className="text-center py-12">
+                            <div className="flex justify-center space-x-1 mb-3">
+                                <div className="w-2 h-2 bg-indigo-400 rounded-full typing-dot"></div>
+                                <div className="w-2 h-2 bg-indigo-400 rounded-full typing-dot"></div>
+                                <div className="w-2 h-2 bg-indigo-400 rounded-full typing-dot"></div>
+                            </div>
+                            <p className="text-sm text-indigo-400">Searching with AI…</p>
+                        </div>
+                    ) : (
+                        <div className="space-y-3">
+                            {filtered.map((deal, idx) => (
+                                <DealCard
+                                    key={`${deal.hotel_id}-${deal.check_in}`}
+                                    deal={deal}
+                                    rank={idx + 1}
+                                    extensionInstalled={extensionInstalled}
+                                    showDates={true}
+                                />
+                            ))}
+                        </div>
+                    )}
                 </div>
             );
         }
