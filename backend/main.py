@@ -364,9 +364,10 @@ class SearchResult(BaseModel):
 async def root():
     """Serve the frontend"""
     html_path = Path(__file__).parent.parent / "frontend" / "index.html"
+    headers = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"}
     if html_path.exists():
-        return HTMLResponse(content=html_path.read_text())
-    return HTMLResponse(content="<h1>GeoPrice API running. Frontend not found.</h1>")
+        return HTMLResponse(content=html_path.read_text(), headers=headers)
+    return HTMLResponse(content="<h1>GeoPrice API running. Frontend not found.</h1>", headers=headers)
 
 
 @app.get("/extension/geoprice-extension.zip")
