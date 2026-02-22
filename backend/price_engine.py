@@ -904,6 +904,12 @@ class PriceEngine:
                     if not room_cheap or not room_exp or room_cheap != room_exp:
                         continue  # Can't confirm same room type — skip
 
+                    # Sanity check: same room type shouldn't differ by more than 4x.
+                    # A larger ratio means different products slipped through (e.g. a
+                    # whole-unit rental vs a single hotel room).
+                    if p_exp > p_cheap * 4:
+                        continue
+
                     pct = (p_exp - p_cheap) / p_exp * 100
                     if pct > best_saving_pct:
                         best_saving_pct = pct
