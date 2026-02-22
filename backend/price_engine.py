@@ -138,51 +138,55 @@ class PriceEngine:
     }
     
     # Direct proxy mapping from data.json (addr:port, no auth required)
-    # Only ports in 8000-9000 range; TR, TH, PT unavailable in this range
+    # Updated from cleaned data.json — bad peers removed by upstream provider
     GEO_PROXIES = {
-        "BR": "79.127.137.165:8030",
-        "IN": "143.244.60.33:8099",
-        "AR": "143.244.61.209:8010",
-        "ID": "143.244.60.33:8101",
-        "PL": "79.127.248.200:8176",
-        "MX": "174.138.162.218:8142",
-        "ZA": "174.138.161.218:8200",
-        # US: no proxy needed — server is in the US
-        "GB": "131.153.1.42:8229",
-        "VN": "143.244.60.33:8237",
-        "MY": "143.244.60.33:8133",
-        "BD": "79.127.248.199:8018",
-        "PK": "79.127.248.199:8167",
-        "BG": "79.127.248.200:8033",
-        "SK": "79.127.248.199:8196",
-        "RS": "79.127.248.199:8192",
-        "HU": "79.127.248.199:8097",
-        "KZ": "79.127.248.200:8112",
-        "NG": "79.127.248.201:8161",
-        "MA": "143.244.60.33:8149",
-        "TN": "79.127.248.201:8221",
-        "PE": "79.127.248.199:8173",
-        "CL": "131.153.1.42:8043",
-        "JP": "131.153.163.154:8110",
-        "KR": "169.150.222.221:8116",
-        "SG": "79.127.248.200:8195",
-        "HK": "79.127.248.201:8096",
-        "FR": "174.138.161.194:8072",
-        "CA": "23.235.247.82:8038",
-        "US": "23.111.180.230:8230",
-        # data.json additional geos
-        "AE": "174.138.161.154:8228",
-        "AT": "131.153.163.234:8014",
-        "AU": "174.138.165.138:8013",
-        "CH": "131.153.163.146:8211",
-        "DE": "174.138.167.250:8080",
-        "ES": "174.138.162.242:8202",
-        "IE": "174.138.162.138:8104",
-        "IT": "174.138.161.186:8106",
-        "KE": "131.153.163.218:8113",
-        "NL": "174.138.161.202:8155",
-        "NZ": "131.153.163.26:8158",
-        # TR, TH, PT: no entries with ports in 8000-9000 range
+        # ── From cleaned data.json (reliable) ────────────────────────────────
+        "AE": "174.138.161.154:8228",   # UAE
+        "AG": "174.138.161.138:8009",   # Antigua
+        "AT": "131.153.163.234:8014",   # Austria
+        "AU": "174.138.165.138:8013",   # Australia
+        "BB": "174.138.165.250:8019",   # Barbados
+        "CA": "23.235.247.82:8038",     # Canada
+        "CH": "131.153.163.146:8211",   # Switzerland
+        "CL": "131.153.1.42:8043",      # Chile
+        "DE": "174.138.167.250:8080",   # Germany
+        "ES": "174.138.162.242:8202",   # Spain
+        "FR": "174.138.161.194:8072",   # France
+        "GB": "131.153.1.42:8229",      # UK
+        "IE": "174.138.162.138:8104",   # Ireland
+        "IL": "131.153.163.178:8105",   # Israel
+        "IT": "174.138.161.186:8106",   # Italy
+        "JM": "174.138.165.146:8109",   # Jamaica
+        "JP": "131.153.163.154:8110",   # Japan
+        "KE": "131.153.163.218:8113",   # Kenya
+        "KR": "169.150.222.221:8116",   # South Korea
+        "MX": "174.138.162.218:8142",   # Mexico
+        "NL": "174.138.161.202:8155",   # Netherlands
+        "NZ": "131.153.163.26:8158",    # New Zealand
+        "PR": "174.138.162.194:8178",   # Puerto Rico
+        "TT": "89.187.182.233:8220",    # Trinidad
+        "VE": "131.153.1.42:8236",      # Venezuela
+        "ZA": "174.138.161.218:8200",   # South Africa
+        # US: no dedicated proxy — server is US-based, direct connection = US prices
+        # ── Legacy IPs not in data.json but confirmed working ─────────────────
+        "BD": "79.127.248.199:8018",    # Bangladesh
+        "BG": "79.127.248.200:8033",    # Bulgaria
+        "BR": "79.127.137.165:8030",    # Brazil
+        "HK": "79.127.248.201:8096",    # Hong Kong
+        "HU": "79.127.248.199:8097",    # Hungary
+        "ID": "143.244.60.33:8101",     # Indonesia
+        "KZ": "79.127.248.200:8112",    # Kazakhstan
+        "MA": "143.244.60.33:8149",     # Morocco
+        "MY": "143.244.60.33:8133",     # Malaysia
+        "NG": "79.127.248.201:8161",    # Nigeria
+        "PE": "79.127.248.199:8173",    # Peru
+        "PL": "79.127.248.200:8176",    # Poland
+        "RS": "79.127.248.199:8192",    # Serbia
+        "SG": "79.127.248.200:8195",    # Singapore
+        "SK": "79.127.248.199:8196",    # Slovakia
+        "TN": "79.127.248.201:8221",    # Tunisia
+        "VN": "143.244.60.33:8237",     # Vietnam
+        # AR, IN, PK removed — no longer in data.json and returning 0 results
     }
 
     # Hotel tier to star mapping for filtering
@@ -386,10 +390,12 @@ class PriceEngine:
         if proxy:
             context_options["proxy"] = proxy
         elif self.proxy_format == "direct":
-            # No proxy available for this geo in direct mode — skip to avoid
-            # scraping with the server's own IP (gives wrong geo prices)
-            print(f"[{geo_code}] No proxy available — skipping")
-            return []
+            if geo_code != "US":
+                # No proxy available for this geo in direct mode — skip to avoid
+                # scraping with the server's own IP (gives wrong geo prices)
+                print(f"[{geo_code}] No proxy available — skipping")
+                return []
+            # US: allow direct connection — all scanner servers are US-based
 
         context = await browser.new_context(**context_options)
         page = await context.new_page()

@@ -27,6 +27,7 @@ Popular cities mode (on the central server):
 
 import asyncio
 import json
+import itertools
 import logging
 import os
 import sqlite3
@@ -429,9 +430,15 @@ async def scan_one_combo(city: str, country: str, check_in: date, check_out: dat
 
 async def run_scan_pass(db_path: str):
     """Single pass: scan all city/date/tier combos not refreshed recently."""
-    all_combos = []
-    for city, country in SCAN_CITIES:
-        all_combos.extend(build_date_combos(city, country))
+    # Build per-city combo lists then interleave round-robin so every city
+    # gets its first combo scanned before any city gets its second, etc.
+    per_city = [build_date_combos(city, country) for city, country in SCAN_CITIES]
+    all_combos = [
+        combo
+        for round_combos in itertools.zip_longest(*per_city)
+        for combo in round_combos
+        if combo is not None
+    ]
 
     log.info(f"Starting scan pass: {len(all_combos)} combos across {len(SCAN_CITIES)} cities")
 
