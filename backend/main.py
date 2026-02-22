@@ -3,7 +3,7 @@ GeoPrice Travel - Backend API
 Chat interface + Price search engine
 """
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel, Field
@@ -1179,6 +1179,70 @@ async def scanner_ingest(request: Request):
     _save_deals(db_path, city, check_in, check_out, tier, deals, 0)
 
     return {"ok": True, "stored": len(deals), "city": city}
+
+
+@app.get("/api/deals/qa")
+async def deals_qa(
+    limit: int = Query(10, ge=1, le=50),
+    city: Optional[str] = Query(None),
+    hotel: Optional[str] = Query(None),
+):
+    """
+    Return deals WITH their raw HTML card snippets for price QA.
+    Allows verifying that the scraped price matches what Booking.com actually showed.
+    Each deal includes:
+      raw_html_cheap    — the full hotel card HTML from the cheapest geo
+      raw_html_expensive — the full hotel card HTML from the expensive geo
+    """
+    import sqlite3 as _sql, json as _json
+    db_path = os.getenv("DEAL_SCANNER_DB", "/tmp/geoprice_deals.db")
+    if not Path(db_path).exists():
+        return {"deals": []}
+
+    conn = _sql.connect(db_path)
+    params: list = []
+    where = "check_in >= ?"
+    params.append(date.today().isoformat())
+    if city:
+        where += " AND city=?"
+        params.append(city)
+    if hotel:
+        where += " AND LOWER(hotel_name) LIKE ?"
+        params.append(f"%{hotel.lower()}%")
+    params.append(limit)
+
+    rows = conn.execute(
+        f"SELECT raw_json, check_in, check_out, tier, nights, city "
+        f"FROM deals WHERE {where} ORDER BY savings_pct DESC LIMIT ?",
+        params,
+    ).fetchall()
+    conn.close()
+
+    results = []
+    for raw, ci, co, tier, nights, city_name in rows:
+        try:
+            d = _json.loads(raw)
+            results.append({
+                "hotel_name": d.get("hotel_name"),
+                "city": city_name,
+                "check_in": ci,
+                "check_out": co,
+                "tier": tier,
+                "nights": nights,
+                "cheapest_geo": d.get("geo_country"),
+                "cheapest_usd": d.get("usd_price"),
+                "expensive_geo": d.get("baseline_geo"),
+                "expensive_usd": d.get("baseline_usd_price"),
+                "savings_percent": d.get("savings_percent"),
+                "all_geo_prices": d.get("all_geo_prices", {}),
+                "booking_url": d.get("booking_url"),
+                "baseline_url": d.get("baseline_url"),
+                "raw_html_cheap": d.get("raw_html_cheap", ""),
+                "raw_html_expensive": d.get("raw_html_expensive", ""),
+            })
+        except Exception:
+            pass
+    return {"deals": results, "count": len(results)}
 
 
 @app.get("/api/neko-sessions")

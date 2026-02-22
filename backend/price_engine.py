@@ -569,7 +569,8 @@ class PriceEngine:
                         hotelId,
                         roomBlockId,
                         freeCancel,
-                        breakfast: breakfastEl
+                        breakfast: breakfastEl,
+                        rawHtml: card.outerHTML
                     };
                 }).filter(h => h.name && h.price);
                 }''')
@@ -627,6 +628,7 @@ class PriceEngine:
                         "free_cancellation": hotel["freeCancel"],
                         "review_score": hotel["reviewScore"],
                         "booking_url": hotel["link"],
+                        "raw_html": hotel.get("rawHtml", ""),
                     })
 
             print(f"[{geo_code}] Found {len(results)} hotels total")
@@ -803,14 +805,10 @@ class PriceEngine:
     ) -> List[Dict[str, Any]]:
         """
         Calculate best deals across all geos.
-        Compares each hotel's price in the cheapest FOREIGN geo vs the US baseline.
-        Only shows deals where a non-US geo is cheaper than US — these are the
-        actual arbitrage opportunities users care about.
-
-        Room-block matching: both the foreign geo and the US baseline must share
-        the same specific room ID (second segment of all_sr_blocks) to ensure we
-        compare the same room type.  If either ID is generic/absent, we allow the
-        comparison (can't confirm mismatch).
+        Compares each hotel's price across ALL geo pairs and finds the best savings.
+        Only considers geo pairs where BOTH have the same specific room block ID
+        (non-zero hotel+room segments in all_sr_blocks) — ensures we're comparing
+        the exact same room type, not different rooms at the same hotel.
         """
         # Group hotels by ID/name, accumulating star data from any geo that has it
         hotels_by_id = {}
@@ -841,52 +839,63 @@ class PriceEngine:
             if not prices:
                 continue
 
-            # Require US baseline — deals are only meaningful if we know what the
-            # user would pay without geo-switching.
-            if baseline_geo not in prices:
+            # Don't show a deal until the baseline country has been scraped —
+            # avoids wild swings from using a random early-arriving geo as baseline
+            effective_baseline_geo = baseline_geo if baseline_geo in prices else ("US" if "US" in prices else None)
+            if effective_baseline_geo is None:
                 continue
-            baseline = prices[baseline_geo]
+            baseline = prices[effective_baseline_geo]
             baseline_price = baseline["usd_price"]
 
             # Skip obviously bad baseline prices (parse failure → near-zero)
             if baseline_price < 5:
                 continue
 
-            us_room_id = self._room_id_from_block(baseline.get("room_type") or "")
+            # Find cheapest geo, excluding any with suspiciously low prices
+            valid_prices = {g: p for g, p in prices.items() if p["usd_price"] >= 5}
+            if not valid_prices:
+                continue
 
-            # Find the cheapest non-US geo that is cheaper than US for the same room
+            # Compare ALL geo pairs — find the single best saving combo
+            # where cheapest_geo vs expensive_geo have the same room block ID.
             best_saving_pct = 0
             best_cheap_geo = None
+            best_exp_geo = None
 
-            for geo, hotel in prices.items():
-                if geo == baseline_geo:
-                    continue  # Skip US — no savings vs itself
+            geo_list = list(valid_prices.keys())
+            for g_cheap in geo_list:
+                for g_exp in geo_list:
+                    if g_cheap == g_exp:
+                        continue
+                    p_cheap = valid_prices[g_cheap]["usd_price"]
+                    p_exp   = valid_prices[g_exp]["usd_price"]
+                    if p_exp <= p_cheap:
+                        continue
 
-                foreign_price = hotel["usd_price"]
-                if foreign_price < 5:
-                    continue  # Skip suspiciously low / parse-failed prices
-                if foreign_price >= baseline_price:
-                    continue  # Not cheaper than US baseline — skip
+                    # Room block matching: both must share the same specific room ID
+                    # (second segment of all_sr_blocks).  The first segment (hotel_id)
+                    # varies by session and geo, so we ignore it.  Room ID '0' means
+                    # generic/unmatched — excluded to avoid cross-room-type comparisons.
+                    room_cheap = self._room_id_from_block(valid_prices[g_cheap].get("room_type") or "")
+                    room_exp   = self._room_id_from_block(valid_prices[g_exp].get("room_type") or "")
+                    if not room_cheap or not room_exp or room_cheap != room_exp:
+                        continue  # Can't confirm same room type — skip
 
-                # Room block matching: if both have specific room IDs, they must match
-                foreign_room_id = self._room_id_from_block(hotel.get("room_type") or "")
-                if us_room_id and foreign_room_id and us_room_id != foreign_room_id:
-                    continue  # Different room types — can't compare
+                    pct = (p_exp - p_cheap) / p_exp * 100
+                    if pct > best_saving_pct:
+                        best_saving_pct = pct
+                        best_cheap_geo  = g_cheap
+                        best_exp_geo    = g_exp
 
-                pct = (baseline_price - foreign_price) / baseline_price * 100
-                if pct > best_saving_pct:
-                    best_saving_pct = pct
-                    best_cheap_geo = geo
-
-            # All geo prices for debug/display
-            valid_prices = {g: p for g, p in prices.items() if p["usd_price"] >= 5}
+            # Also record all geo prices for debug/display
             all_geo_prices = {g: round(p["usd_price"], 2) for g, p in valid_prices.items()}
 
             if best_cheap_geo is None or best_saving_pct < 1:
                 continue
 
-            cheapest = prices[best_cheap_geo]
-            savings_usd = baseline_price - cheapest["usd_price"]
+            cheapest  = valid_prices[best_cheap_geo]
+            expensive = valid_prices[best_exp_geo]
+            savings_usd = expensive["usd_price"] - cheapest["usd_price"]
 
             best_deals.append({
                 "hotel_name": hotel_data["hotel_name"],
@@ -899,17 +908,20 @@ class PriceEngine:
                 "geo_price": cheapest["geo_price"],
                 "geo_currency": cheapest["geo_currency"],
                 "usd_price": cheapest["usd_price"],
-                "baseline_usd_price": baseline_price,
-                "baseline_geo": baseline_geo,
-                "baseline_geo_name": self.GEO_COUNTRIES.get(baseline_geo, {}).get("name", baseline_geo),
+                "baseline_usd_price": expensive["usd_price"],
+                "baseline_geo": best_exp_geo,
+                "baseline_geo_name": self.GEO_COUNTRIES.get(best_exp_geo, {}).get("name", best_exp_geo),
                 "savings_percent": round(best_saving_pct, 1),
                 "savings_usd": round(savings_usd, 2),
                 "includes_breakfast": cheapest.get("includes_breakfast", False),
                 "free_cancellation": cheapest.get("free_cancellation", False),
                 "booking_url": cheapest["booking_url"],
-                "baseline_url": baseline.get("booking_url", ""),
+                "baseline_url": expensive.get("booking_url", ""),
                 "all_geo_prices": all_geo_prices,
-                "us_price": baseline_price,
+                "us_price": valid_prices.get("US", {}).get("usd_price"),
+                # Raw HTML of cheapest and expensive cards for price QA
+                "raw_html_cheap": cheapest.get("raw_html", ""),
+                "raw_html_expensive": expensive.get("raw_html", ""),
             })
 
         # Sort by savings percentage
