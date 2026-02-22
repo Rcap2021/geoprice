@@ -271,6 +271,23 @@ async def on_startup():
     except Exception:
         pass
     asyncio.create_task(_start_connect_proxy())
+    asyncio.create_task(_run_verification_loop())
+
+
+async def _run_verification_loop():
+    """Verify unverified deals every 30 minutes on the main server."""
+    import asyncio as _asyncio
+    db_path = os.getenv("DEAL_SCANNER_DB", "/tmp/geoprice_deals.db")
+    # Give the server a moment to fully start
+    await _asyncio.sleep(60)
+    while True:
+        try:
+            from deal_scanner import init_db as _init_db, run_verification_pass as _verify
+            _init_db(db_path)
+            await _verify(db_path)
+        except Exception as e:
+            print(f"[verify] error: {e}")
+        await _asyncio.sleep(1800)  # 30 minutes
 
 
 # ============== Models ==============
@@ -1212,14 +1229,14 @@ async def deals_qa(
     params.append(limit)
 
     rows = conn.execute(
-        f"SELECT raw_json, check_in, check_out, tier, nights, city "
-        f"FROM deals WHERE {where} ORDER BY savings_pct DESC LIMIT ?",
+        f"SELECT raw_json, check_in, check_out, tier, nights, city, is_verified, verified_at "
+        f"FROM deals WHERE {where} ORDER BY is_verified DESC, savings_pct DESC LIMIT ?",
         params,
     ).fetchall()
     conn.close()
 
     results = []
-    for raw, ci, co, tier, nights, city_name in rows:
+    for raw, ci, co, tier, nights, city_name, is_verified, verified_at in rows:
         try:
             d = _json.loads(raw)
             results.append({
@@ -1239,6 +1256,8 @@ async def deals_qa(
                 "baseline_url": d.get("baseline_url"),
                 "raw_html_cheap": d.get("raw_html_cheap", ""),
                 "raw_html_expensive": d.get("raw_html_expensive", ""),
+                "is_verified": bool(is_verified),
+                "verified_at": verified_at,
             })
         except Exception:
             pass

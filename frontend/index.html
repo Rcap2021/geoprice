@@ -371,6 +371,7 @@
             const baseFlag = COUNTRY_FLAGS[deal.baseline_geo || 'US'] || '🇺🇸';
             const savingsPct = deal.savings_percent || 0;
             const badgeColor = savingsPct >= 20 ? 'bg-green-500' : savingsPct >= 10 ? 'bg-emerald-400' : 'bg-teal-400';
+            const isVerified = deal.is_verified === true;
 
             const handleBookViaExtension = async () => {
                 setExtLoading(true);
@@ -451,7 +452,13 @@
                             {rank}
                         </div>
                         <div className="flex-1 min-w-0">
-                            <h4 className="font-semibold text-gray-800 text-sm leading-tight truncate">{deal.hotel_name}</h4>
+                            <div className="flex items-center gap-1.5">
+                                <h4 className="font-semibold text-gray-800 text-sm leading-tight truncate">{deal.hotel_name}</h4>
+                                {isVerified
+                                    ? <span title="Price verified by re-scan" className="flex-shrink-0 text-green-600 text-xs font-semibold bg-green-50 border border-green-200 px-1.5 py-0.5 rounded-full">✓ Verified</span>
+                                    : <span title="Awaiting re-scan verification" className="flex-shrink-0 text-gray-400 text-xs font-medium bg-gray-50 border border-gray-200 px-1.5 py-0.5 rounded-full">⏳ Pending</span>
+                                }
+                            </div>
                             <p className="text-xs text-gray-400 mt-0.5 truncate">{deal.location}</p>
                             <div className="flex items-center gap-2 mt-0.5 flex-wrap">
                                 {stars && <p className="text-yellow-400 text-xs">{stars}</p>}

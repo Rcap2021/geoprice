@@ -123,7 +123,10 @@ def init_db(db_path: str = DB_PATH):
             booking_url         TEXT,
             baseline_url        TEXT,
             scanned_at          TEXT    NOT NULL,
-            raw_json            TEXT
+            raw_json            TEXT,
+            is_verified         INTEGER DEFAULT 0,
+            verified_at         TEXT,
+            verify_fails        INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS scan_log (
@@ -137,12 +140,27 @@ def init_db(db_path: str = DB_PATH):
             duration_s  REAL    DEFAULT 0
         );
 
-        CREATE INDEX IF NOT EXISTS idx_deals_savings  ON deals(savings_pct DESC);
-        CREATE INDEX IF NOT EXISTS idx_deals_checkin  ON deals(check_in);
-        CREATE INDEX IF NOT EXISTS idx_deals_hotel    ON deals(hotel_id);
-        CREATE INDEX IF NOT EXISTS idx_deals_city     ON deals(city);
-        CREATE INDEX IF NOT EXISTS idx_log_combo      ON scan_log(check_in, check_out, tier);
+        CREATE INDEX IF NOT EXISTS idx_deals_savings    ON deals(savings_pct DESC);
+        CREATE INDEX IF NOT EXISTS idx_deals_checkin    ON deals(check_in);
+        CREATE INDEX IF NOT EXISTS idx_deals_hotel      ON deals(hotel_id);
+        CREATE INDEX IF NOT EXISTS idx_deals_city       ON deals(city);
+        CREATE INDEX IF NOT EXISTS idx_log_combo        ON scan_log(check_in, check_out, tier);
     """)
+    # Migration: add verification columns to existing DBs (ALTER TABLE is idempotent via try/except)
+    for col, defn in [
+        ("is_verified",  "INTEGER DEFAULT 0"),
+        ("verified_at",  "TEXT"),
+        ("verify_fails", "INTEGER DEFAULT 0"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE deals ADD COLUMN {col} {defn}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    # Create the verified index after migration ensures the column exists
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_deals_verified ON deals(is_verified)")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -179,8 +197,9 @@ def save_deals(db_path: str, city: str, check_in: date, check_out: date,
                 hotel_id, hotel_name, stars,
                 cheapest_geo, cheapest_geo_name, cheapest_usd,
                 baseline_geo, baseline_usd, savings_pct, savings_usd,
-                booking_url, baseline_url, scanned_at, raw_json)
-               VALUES (?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?,?,?)""",
+                booking_url, baseline_url, scanned_at, raw_json,
+                is_verified, verified_at, verify_fails)
+               VALUES (?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?)""",
             (
                 city, check_in.isoformat(), check_out.isoformat(), nights, tier,
                 d.get("hotel_id"), d.get("hotel_name"), d.get("stars"),
@@ -189,6 +208,7 @@ def save_deals(db_path: str, city: str, check_in: date, check_out: date,
                 d.get("savings_percent"), d.get("savings_usd"),
                 d.get("booking_url"), d.get("baseline_url"),
                 now, json.dumps(d),
+                0, None, 0,
             ),
         )
 
@@ -199,6 +219,183 @@ def save_deals(db_path: str, city: str, check_in: date, check_out: date,
     )
     conn.commit()
     conn.close()
+
+
+# ── Deal Verification ─────────────────────────────────────────────────────────
+
+VERIFY_MIN_AGE_MINUTES = int(os.getenv("VERIFY_MIN_AGE_MINUTES", "60"))
+VERIFY_SAVINGS_RATIO   = float(os.getenv("VERIFY_SAVINGS_RATIO", "0.7"))  # deal valid if savings still >= original * 0.7
+VERIFY_MAX_FAILS       = int(os.getenv("VERIFY_MAX_FAILS", "2"))
+VERIFY_CONCURRENCY     = int(os.getenv("VERIFY_CONCURRENCY", "2"))
+
+
+def get_unverified_deals(db_path: str, min_age_minutes: int = VERIFY_MIN_AGE_MINUTES,
+                         limit: int = 30) -> list:
+    """Return unverified deals older than min_age_minutes with fewer than MAX_FAILS failures."""
+    if not Path(db_path).exists():
+        return []
+    conn = sqlite3.connect(db_path)
+    cutoff = (datetime.utcnow() - timedelta(minutes=min_age_minutes)).isoformat()
+    rows = conn.execute(
+        """SELECT id, city, check_in, check_out, tier,
+                  cheapest_geo, baseline_geo,
+                  cheapest_usd, baseline_usd,
+                  hotel_id, hotel_name, verify_fails, savings_pct
+           FROM deals
+           WHERE is_verified = 0
+             AND verify_fails < ?
+             AND scanned_at <= ?
+             AND check_in >= ?
+           ORDER BY savings_pct DESC
+           LIMIT ?""",
+        (VERIFY_MAX_FAILS, cutoff, date.today().isoformat(), limit),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def _mark_deal_verified(db_path: str, deal_id: int, refreshed: dict):
+    """Update deal with fresh prices and mark it verified."""
+    conn = sqlite3.connect(db_path)
+    now = datetime.utcnow().isoformat()
+    conn.execute(
+        """UPDATE deals SET
+               is_verified   = 1,
+               verified_at   = ?,
+               verify_fails  = 0,
+               cheapest_usd  = ?,
+               baseline_usd  = ?,
+               savings_pct   = ?,
+               savings_usd   = ?,
+               booking_url   = ?,
+               baseline_url  = ?,
+               raw_json      = ?
+           WHERE id = ?""",
+        (
+            now,
+            refreshed.get("usd_price"),
+            refreshed.get("baseline_usd_price"),
+            refreshed.get("savings_percent"),
+            refreshed.get("savings_usd"),
+            refreshed.get("booking_url"),
+            refreshed.get("baseline_url"),
+            json.dumps(refreshed),
+            deal_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _fail_deal(db_path: str, deal_id: int):
+    """Increment verify_fails; delete the deal once it hits VERIFY_MAX_FAILS."""
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE deals SET verify_fails = verify_fails + 1 WHERE id = ?",
+        (deal_id,),
+    )
+    conn.execute(
+        "DELETE FROM deals WHERE id = ? AND verify_fails >= ?",
+        (deal_id, VERIFY_MAX_FAILS),
+    )
+    conn.commit()
+    conn.close()
+
+
+async def verify_one_deal(deal_row: tuple, db_path: str) -> bool:
+    """Re-scrape both geos for a deal and confirm the price difference still holds.
+
+    Returns True if verified, False if the deal failed/was removed.
+    """
+    from price_engine import PriceEngine
+
+    try:
+        from chat_service import TravelIntent
+    except ImportError:
+        from price_engine import TravelIntent
+
+    (deal_id, city, check_in_str, check_out_str, tier,
+     cheap_geo, exp_geo, cheap_usd, exp_usd,
+     hotel_id, hotel_name, verify_fails, orig_savings_pct) = deal_row
+
+    check_in  = date.fromisoformat(check_in_str)
+    check_out = date.fromisoformat(check_out_str)
+
+    # Expired deal — remove it
+    if check_in < date.today():
+        _fail_deal(db_path, deal_id)
+        log.info(f"  ✗ Removed expired deal: {hotel_name} (check-in {check_in_str})")
+        return False
+
+    engine = PriceEngine()
+    engine.max_pages = 2  # 2 pages (50 hotels) is enough to find the hotel
+
+    intent = TravelIntent(
+        destination_city=city,
+        check_in=check_in,
+        check_out=check_out,
+        guests=2,
+        rooms=1,
+        hotel_tier=tier,
+    )
+
+    all_results: dict = {}
+    try:
+        async for update in engine.search_all_geos(intent, geos=[cheap_geo, exp_geo]):
+            if "geo_results" in update:
+                all_results[update["geo"]] = update["geo_results"]
+    except Exception as e:
+        log.warning(f"  ✗ Verify scrape error ({hotel_name}): {e}")
+        _fail_deal(db_path, deal_id)
+        return False
+
+    # Find the specific hotel in the re-scraped results
+    deals = engine.calculate_best_deals(all_results)
+    match = next((d for d in deals if d.get("hotel_id") == hotel_id), None)
+
+    if not match:
+        log.info(f"  ✗ Verify: {hotel_name} no longer found in both geos — removing")
+        _fail_deal(db_path, deal_id)
+        return False
+
+    new_savings = match.get("savings_percent", 0)
+    threshold   = orig_savings_pct * VERIFY_SAVINGS_RATIO
+
+    if new_savings >= threshold:
+        log.info(
+            f"  ✓ Verified: {hotel_name}  "
+            f"{match['geo_country']}/${match['usd_price']:.0f} vs "
+            f"{match['baseline_geo']}/${match['baseline_usd_price']:.0f}  "
+            f"({new_savings:.1f}%)"
+        )
+        _mark_deal_verified(db_path, deal_id, match)
+        return True
+    else:
+        log.info(
+            f"  ✗ Verify: {hotel_name} savings dropped {orig_savings_pct:.1f}% → {new_savings:.1f}% — removing"
+        )
+        _fail_deal(db_path, deal_id)
+        return False
+
+
+async def run_verification_pass(db_path: str):
+    """Verify all unverified deals older than VERIFY_MIN_AGE_MINUTES."""
+    unverified = get_unverified_deals(db_path)
+    if not unverified:
+        log.info("Verification pass: nothing to verify yet")
+        return
+
+    log.info(f"Verification pass: {len(unverified)} deals to check")
+    sem = asyncio.Semaphore(VERIFY_CONCURRENCY)
+
+    async def bounded(row):
+        async with sem:
+            return await verify_one_deal(row, db_path)
+
+    results = await asyncio.gather(*[bounded(r) for r in unverified], return_exceptions=True)
+    ok   = sum(1 for r in results if r is True)
+    fail = sum(1 for r in results if r is False)
+    log.info(f"Verification pass complete: {ok} verified ✓  {fail} removed ✗")
 
 
 async def report_deals_remote(city: str, check_in: date, check_out: date,
@@ -239,48 +436,52 @@ EXTENSION_GEOS = {
 
 def get_featured_deals(db_path: str = DB_PATH, limit: int = 20,
                        min_savings: float = MIN_SAVINGS_PCT,
-                       city: Optional[str] = None) -> List[dict]:
+                       city: Optional[str] = None,
+                       verified_only: bool = False) -> List[dict]:
     """Return top deals sorted by savings % — only for future check-ins.
 
-    If city is given, filter to that city only.  Otherwise return all cities.
+    Verified deals are always listed first.  Pass verified_only=True to
+    exclude unverified deals.
     """
     if not Path(db_path).exists():
         return []
     conn = sqlite3.connect(db_path)
+    base = (
+        "SELECT raw_json, check_in, check_out, tier, nights, city, is_verified, verified_at "
+        "FROM deals "
+        "WHERE savings_pct >= ? AND check_in >= ?"
+    )
+    params: list = [min_savings, date.today().isoformat()]
+
     if city:
-        rows = conn.execute(
-            "SELECT raw_json, check_in, check_out, tier, nights, city "
-            "FROM deals "
-            "WHERE savings_pct >= ? AND check_in >= ? AND city=? "
-            "ORDER BY savings_pct DESC "
-            "LIMIT ?",
-            (min_savings, date.today().isoformat(), city, limit),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT raw_json, check_in, check_out, tier, nights, city "
-            "FROM deals "
-            "WHERE savings_pct >= ? AND check_in >= ? "
-            "ORDER BY savings_pct DESC "
-            "LIMIT ?",
-            (min_savings, date.today().isoformat(), limit),
-        ).fetchall()
+        base += " AND city=?"
+        params.append(city)
+    if verified_only:
+        base += " AND is_verified=1"
+
+    # Verified deals first, then by savings %
+    base += " ORDER BY is_verified DESC, savings_pct DESC LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(base, params).fetchall()
     conn.close()
     return [d for row in rows for d in [_row_to_deal(row)] if d]
 
 
 def _row_to_deal(row) -> Optional[dict]:
-    """Convert a DB row (raw_json, check_in, check_out, tier, nights, city) to a deal dict."""
-    raw, ci, co, tier, nights, city_name = row
+    """Convert a DB row to a deal dict."""
+    raw, ci, co, tier, nights, city_name, is_verified, verified_at = row
     try:
         d = json.loads(raw)
         if d.get("geo_country", "").upper() not in EXTENSION_GEOS:
             return None
-        d["check_in"] = ci
-        d["check_out"] = co
-        d["tier"] = tier
-        d["nights"] = nights
-        d["city"] = city_name
+        d["check_in"]    = ci
+        d["check_out"]   = co
+        d["tier"]        = tier
+        d["nights"]      = nights
+        d["city"]        = city_name
+        d["is_verified"] = bool(is_verified)
+        d["verified_at"] = verified_at
         return d
     except Exception:
         return None
@@ -458,16 +659,28 @@ async def run_scan_pass(db_path: str):
 
 
 async def run_daemon(db_path: str):
-    """Continuous daemon: scan → sleep LOOP_PAUSE_HOURS → repeat."""
+    """Continuous daemon: scan → verify every 30 min during sleep → repeat."""
     init_db(db_path)
     city_list = ", ".join(c for c, _ in SCAN_CITIES)
     log.info(f"Deal scanner daemon started. Cities: {city_list}  DB={db_path}")
     if REPORT_URL:
         log.info(f"Remote reporting enabled → {REPORT_URL}")
     while True:
+        # Run scan pass, then immediately verify any deals already in DB
         await run_scan_pass(db_path)
-        log.info(f"Sleeping {LOOP_PAUSE_HOURS}h before next pass…")
-        await asyncio.sleep(LOOP_PAUSE_HOURS * 3600)
+        await run_verification_pass(db_path)
+
+        # During the inter-pass sleep, keep verifying new deals every 30 min
+        log.info(f"Sleeping {LOOP_PAUSE_HOURS}h before next scan pass…")
+        sleep_secs   = int(LOOP_PAUSE_HOURS * 3600)
+        verify_every = 1800  # 30 minutes
+        elapsed      = 0
+        while elapsed < sleep_secs:
+            chunk    = min(verify_every, sleep_secs - elapsed)
+            await asyncio.sleep(chunk)
+            elapsed += chunk
+            if elapsed < sleep_secs:
+                await run_verification_pass(db_path)
 
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────

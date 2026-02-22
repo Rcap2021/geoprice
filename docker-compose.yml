@@ -10,9 +10,7 @@ services:
       - "8000:8000"
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - PROXY_BASE_URL=${PROXY_BASE_URL}
-      - PROXY_USERNAME=${PROXY_USERNAME}
-      - PROXY_PASSWORD=${PROXY_PASSWORD}
+      - PROXY_FORMAT=direct
       - DATABASE_URL=${DATABASE_URL:-sqlite:///./geoprice.db}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
     volumes:
