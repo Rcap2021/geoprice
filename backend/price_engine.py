@@ -477,6 +477,29 @@ class PriceEngine:
                                 isPerNight = true;
                             }
 
+                            // When per-night: find the TOTAL stay price in the card.
+                            // Booking.com always displays the total alongside the per-night price.
+                            // Use this total directly — avoids tax/multiplication errors.
+                            if (isPerNight) {
+                                // Pattern 1: "Original price $200. Current price $70."
+                                // — $70 is the discounted all-in total for the stay
+                                const curMatch = text.match(/[Cc]urrent\s+price\s+(?:US)?\$?([\d,]+(?:\.\d+)?)/);
+                                if (curMatch) {
+                                    price = curMatch[1];
+                                    isPerNight = false;
+                                    // Don't break — still look for taxes below
+                                }
+                                // Pattern 2: "Per night $45 $146 Price $146"
+                                // — standalone "Price $X" is the non-discounted all-in total
+                                if (isPerNight) {
+                                    const totMatch = text.match(/\bPrice\s+(?:US)?\$?([\d,]+(?:\.\d+)?)/);
+                                    if (totMatch) {
+                                        price = totMatch[1];
+                                        isPerNight = false;
+                                    }
+                                }
+                            }
+
                             // Tax with "+" prefix (most non-US locales):
                             // "+ $XX taxes / impuesto / taxe / ..."
                             const taxMatchPlus = text.match(
